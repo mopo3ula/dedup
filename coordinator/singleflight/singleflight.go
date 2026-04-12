@@ -27,21 +27,32 @@ func New() *Coordinator {
 
 // Run implements [dedup.Coordinator].
 //
-// If a call for key is already in-flight, Run blocks until it completes and
-// returns the same value. The third return value of singleflight (shared bool)
-// is intentionally ignored; the [dedup.Deduplicator] layer handles fan-out.
+// If a call for key is already in-flight, Run waits for either:
+//   - the shared singleflight result, or
+//   - ctx.Done() for this local caller.
+//
+// If ctx is canceled first, Run returns ctx.Err() for this caller only.
+// The in-flight original call continues running independently, and other
+// waiters can still receive its result. The [dedup.Deduplicator] layer handles
+// fan-out, so the shared bool from singleflight is intentionally ignored.
 func (c *Coordinator) Run(
 	ctx context.Context,
 	key string,
 	fn func(context.Context) (*dedup.Envelope, error),
 ) (*dedup.Envelope, error) {
-	v, err, _ := c.group.Do(key, func() (any, error) {
-		return fn(ctx)
+	resultCh := c.group.DoChan(key, func() (any, error) {
+		return fn(context.Background())
 	})
-	if err != nil {
-		return nil, err
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case result := <-resultCh:
+		if result.Err != nil {
+			return nil, result.Err
+		}
+		return result.Val.(*dedup.Envelope), nil
 	}
-	return v.(*dedup.Envelope), nil
 }
 
 // Compile-time interface check.
