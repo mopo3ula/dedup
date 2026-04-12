@@ -1,10 +1,10 @@
 module github.com/mopo3ula/dedup
 
-go 1.25.0
+go 1.24.0
 
 require (
 	github.com/redis/go-redis/v9 v9.18.0
-	golang.org/x/sync v0.20.0
+	golang.org/x/sync v0.16.0
 )
 
 require (

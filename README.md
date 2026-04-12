@@ -240,5 +240,5 @@ Redis coordinator options (`coordinator/redis.Options`):
 
 ## Requirements
 
-- Go 1.23+
-- Redis 6+ (only for `coordinator/redis` and `store/redis`)
+- Go 1.24+
+- Redis 7+ (only for `coordinator/redis` and `store/redis`)
