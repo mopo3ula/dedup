@@ -147,7 +147,11 @@ func (s *MyStore) Set(ctx context.Context, key string, value *dedup.Envelope, tt
 ```go
 import "github.com/mopo3ula/dedup/key"
 key.FromParts("POST", "/api/pay", string(body)) // variadic parts → SHA-256
-key.FromJSON(protoRequest) // JSON-marshal → SHA-256
+k, err := key.FromJSON(protoRequest) // JSON-marshal → SHA-256
+if err != nil {
+// handle marshal error (e.g., unsupported values like chan/func)
+}
+_ = k
 key.FromMap(map[string]string{"uid": "1", "op": "pay"}) // sorted map → SHA-256
 ```
 

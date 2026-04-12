@@ -63,4 +63,7 @@
 //	})
 //
 // Use [key.FromParts] or [key.FromJSON] to derive stable, collision-resistant keys.
+// [key.FromJSON] returns an error when a value cannot be marshalled by encoding/json
+// (for example, when it contains chan or func fields), so callers should handle it
+// explicitly.
 package dedup
