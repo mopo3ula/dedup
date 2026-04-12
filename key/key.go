@@ -33,9 +33,25 @@ func FromParts(parts ...string) string {
 //
 // Example – gRPC request:
 //
-//	k := key.FromJSON(req)
-func FromJSON(v any) string {
-	b, _ := json.Marshal(v)
+//	k, err := key.FromJSON(req)
+func FromJSON(v any) (string, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "", err
+	}
+	return FromParts(string(b)), nil
+}
+
+// MustFromJSON is a deprecated compatibility wrapper around [FromJSON].
+//
+// Deprecated: use [FromJSON] and handle its error explicitly. This helper
+// intentionally falls back to hashing an empty payload on marshal errors to
+// preserve pre-v1 behaviour where errors from json.Marshal were silently ignored.
+func MustFromJSON(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return FromParts("")
+	}
 	return FromParts(string(b))
 }
 
