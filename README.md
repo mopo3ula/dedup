@@ -29,59 +29,96 @@ go get github.com/mopo3ula/dedup
 ### Single process (no external dependencies)
 
 ```go
+package main
+
 import (
-"github.com/mopo3ula/dedup"
-sfcoord  "github.com/mopo3ula/dedup/coordinator/singleflight"
-memstore "github.com/mopo3ula/dedup/store/inmemory"
+    "time"
+
+    "github.com/mopo3ula/dedup"
+    sfcoord "github.com/mopo3ula/dedup/coordinator/singleflight"
+    memstore "github.com/mopo3ula/dedup/store/inmemory"
 )
-d := dedup.New(
-memstore.New(),
-sfcoord.New(),
-&dedup.Options{ResultTTL: 30 * time.Second},
-)
+
+func main() {
+    d := dedup.New(
+        memstore.New(),
+        sfcoord.New(),
+        &dedup.Options{ResultTTL: 30 * time.Second},
+    )
+
+    _ = d // use in your handlers
+}
 ```
 
 ### Multi-instance (shared Redis)
 
 ```go
-import (
-"github.com/mopo3ula/dedup"
-rediscoord "github.com/mopo3ula/dedup/coordinator/redis"
-redistore  "github.com/mopo3ula/dedup/store/redis"
-goredis    "github.com/redis/go-redis/v9"
-)
-rdb := goredis.NewClient(&goredis.Options{Addr: "127.0.0.1:6379"})
-d := dedup.New(
-redistore.New(rdb, "myapp:result:"),
-rediscoord.New(rdb, &rediscoord.Options{Prefix: "myapp"}),
-&dedup.Options{ResultTTL: 30 * time.Second},
-)
-```
+package main
 
+import (
+    "time"
+
+    "github.com/mopo3ula/dedup"
+    rediscoord "github.com/mopo3ula/dedup/coordinator/redis"
+    redistore "github.com/mopo3ula/dedup/store/redis"
+    goredis "github.com/redis/go-redis/v9"
+)
+
+func main() {
+    rdb := goredis.NewClient(&goredis.Options{Addr: "127.0.0.1:6379"})
+
+    d := dedup.New(
+        redistore.New(rdb, "myapp:result:"),
+        rediscoord.New(rdb, &rediscoord.Options{Prefix: "myapp"}),
+        &dedup.Options{ResultTTL: 30 * time.Second},
+    )
+
+    _ = d // use in your handlers
+}
+```
 Both variants expose **the same API**. Switching is a one-line change in
 the initialisation code; all callers of `d.Do(...)` remain untouched.
 
 ## Usage
 
 ```go
-import "github.com/mopo3ula/dedup/key"
+package handlers
+
+import (
+    "context"
+    "time"
+
+    "github.com/mopo3ula/dedup"
+    "github.com/mopo3ula/dedup/key"
+)
+
 // Build a stable key from whatever uniquely identifies the request.
-k := key.FromParts(userID, action, string(requestBody))
-env, err := d.Do(ctx, k, func (ctx context.Context) (*dedup.Envelope, error) {
-// This function is called at most once per key per ResultTTL window.
-result, err := callExpensiveUpstream(ctx)
-if err != nil {
-return nil, err
+func handle(ctx context.Context, d *dedup.Deduplicator, userID, action string, requestBody []byte) ([]byte, error) {
+    k := key.FromParts(userID, action, string(requestBody))
+
+    env, err := d.Do(ctx, k, func(ctx context.Context) (*dedup.Envelope, error) {
+        // This function is called at most once per key per ResultTTL window.
+        result, err := callExpensiveUpstream(ctx)
+        if err != nil {
+            return nil, err
+        }
+        return &dedup.Envelope{
+            Payload: result,
+            Meta:    map[string]string{"content-type": "application/json"},
+        }, nil
+    })
+    if err != nil {
+        return nil, err
+    }
+    // env.Payload contains the result — identical for all concurrent duplicates.
+    return env.Payload, nil
 }
-return &dedup.Envelope{
-Payload: result,
-Meta:    map[string]string{"content-type": "application/json"},
-}, nil
-})
-if err != nil {
-return err
+
+// callExpensiveUpstream is a placeholder for the real business call.
+func callExpensiveUpstream(ctx context.Context) ([]byte, error) {
+    time.Sleep(50 * time.Millisecond)
+    return []byte(`{"ok":true}`), nil
 }
-// env.Payload contains the result — identical for all concurrent duplicates.
 ```
 
 ## Package layout
@@ -120,39 +157,70 @@ Request C ──► Do(ctx, key, fn) ──► ResultStore.Get ─────�
 ### Custom coordinator
 
 ```go
+package custom
+
+import "github.com/mopo3ula/dedup"
+
 type MyCoordinator struct{}
+
 func (c *MyCoordinator) Run(
-ctx context.Context,
-key string,
-fn func (context.Context) (*dedup.Envelope, error),
+    ctx context.Context,
+    key string,
+    fn func(context.Context) (*dedup.Envelope, error),
 ) (*dedup.Envelope, error) {
-// your coordination logic
+    // your coordination logic
+    return fn(ctx)
 }
 ```
 
 ### Custom store
 
 ```go
+package custom
+
+import (
+    "context"
+    "time"
+
+    "github.com/mopo3ula/dedup"
+)
+
 type MyStore struct{}
+
 func (s *MyStore) Get(ctx context.Context, key string) (*dedup.Envelope, error) {
-// return dedup.ErrNotFound if absent or expired
+    // return dedup.ErrNotFound if absent or expired
+    return nil, dedup.ErrNotFound
 }
+
 func (s *MyStore) Set(ctx context.Context, key string, value *dedup.Envelope, ttl time.Duration) error {
-// persist value
+    // persist value
+    return nil
 }
 ```
 
 ## Key helpers
 
 ```go
-import "github.com/mopo3ula/dedup/key"
-key.FromParts("POST", "/api/pay", string(body)) // variadic parts → SHA-256
-k, err := key.FromJSON(protoRequest) // JSON-marshal → SHA-256
-if err != nil {
-// handle marshal error (e.g., unsupported values like chan/func)
+package example
+
+import (
+    "fmt"
+
+    "github.com/mopo3ula/dedup/key"
+)
+
+func examples() {
+    k1 := key.FromParts("POST", "/api/pay", "{...body...}") // variadic parts → SHA-256
+    fmt.Println(k1)
+
+    k2 := key.FromMap(map[string]string{"uid": "1", "op": "pay"}) // sorted map → SHA-256
+    fmt.Println(k2)
+
+    // FromJSON may return a non-deterministic error if the value contains unsupported types.
+    if k3, err := key.FromJSON(map[string]any{"a": 1}); err == nil {
+        fmt.Println(k3)
+    }
 }
-_ = k
-key.FromMap(map[string]string{"uid": "1", "op": "pay"}) // sorted map → SHA-256
 ```
 
 ## Configuration
@@ -172,9 +240,5 @@ Redis coordinator options (`coordinator/redis.Options`):
 
 ## Requirements
 
-- Go 1.21+
+- Go 1.23+
 - Redis 6+ (only for `coordinator/redis` and `store/redis`)
-
-## License
-
-[MIT](LICENSE)
