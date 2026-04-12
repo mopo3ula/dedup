@@ -108,6 +108,9 @@ func (d *Deduplicator) Do(
 		if callErr != nil {
 			return nil, callErr
 		}
+		if res == nil {
+			return nil, errors.New("dedup: fn returned nil envelope")
+		}
 
 		res = res.clone()
 		res.CreatedAt = d.opt.Now().UTC()
