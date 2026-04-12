@@ -1,0 +1,23 @@
+# Binaries
+bin/
+*.exe
+
+# Test cache
+*.test
+*.prof
+cpu.prof
+mem.prof
+
+# Go workspace
+go.work
+go.work.sum
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
