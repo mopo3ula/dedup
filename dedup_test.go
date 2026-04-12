@@ -2,6 +2,7 @@ package dedup_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -132,6 +133,30 @@ func TestEmptyKeyReturnsError(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error for empty key, got nil")
+	}
+}
+
+// TestNilEnvelopeWithoutErrorReturnsMeaningfulError verifies that fn returning
+// (nil, nil) does not panic and produces an explicit validation error.
+func TestNilEnvelopeWithoutErrorReturnsMeaningfulError(t *testing.T) {
+	d := newTestDeduplicator(time.Second)
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Do panicked: %v", r)
+		}
+	}()
+
+	_, err := d.Do(context.Background(), "nil-envelope", func(ctx context.Context) (*dedup.Envelope, error) {
+		return nil, nil
+	})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	wantErr := errors.New("dedup: fn returned nil envelope")
+	if !errors.Is(err, wantErr) && err.Error() != wantErr.Error() {
+		t.Fatalf("error = %q, want %q", err.Error(), wantErr.Error())
 	}
 }
 
