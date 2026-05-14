@@ -32,16 +32,18 @@ func New() *Coordinator {
 //   - ctx.Done() for this local caller.
 //
 // If ctx is canceled first, Run returns ctx.Err() for this caller only.
-// The in-flight original call continues running independently, and other
-// waiters can still receive its result. The [dedup.Deduplicator] layer handles
-// fan-out, so the shared bool from singleflight is intentionally ignored.
+// The in-flight original call continues running independently with ctx values
+// preserved but cancellation ignored, and other waiters can still receive its
+// result. The [dedup.Deduplicator] layer handles fan-out, so the shared bool
+// from singleflight is intentionally ignored.
 func (c *Coordinator) Run(
 	ctx context.Context,
 	key string,
 	fn func(context.Context) (*dedup.Envelope, error),
 ) (*dedup.Envelope, error) {
+	execCtx := context.WithoutCancel(ctx)
 	resultCh := c.group.DoChan(key, func() (any, error) {
-		return fn(context.Background())
+		return fn(execCtx)
 	})
 
 	select {

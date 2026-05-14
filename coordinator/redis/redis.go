@@ -11,6 +11,7 @@ package redis
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -20,10 +21,9 @@ import (
 
 // Options configures the Redis coordinator.
 type Options struct {
-	// LockTTL is the maximum time the distributed lock is held. If the
-	// original handler runs longer than this the lock may expire and a second
-	// instance could start executing. Keep this value comfortably above your
-	// expected handler latency.
+	// LockTTL is the distributed lock lease duration. The coordinator renews
+	// the lease while the original handler is running, so this value only needs
+	// to cover short Redis/network hiccups between renewals.
 	// Default: 5s.
 	LockTTL time.Duration
 
@@ -45,6 +45,7 @@ type Coordinator struct {
 	waitStep   time.Duration
 	keyPrefix  string
 	chanPrefix string
+	errPrefix  string
 }
 
 // New creates a Coordinator using the provided Redis client.
@@ -72,6 +73,7 @@ func New(client goredis.UniversalClient, opt *Options) *Coordinator {
 		waitStep:   cfg.WaitStep,
 		keyPrefix:  fmt.Sprintf("%s:lock:", cfg.Prefix),
 		chanPrefix: fmt.Sprintf("%s:done:", cfg.Prefix),
+		errPrefix:  fmt.Sprintf("%s:error:", cfg.Prefix),
 	}
 }
 
@@ -79,17 +81,19 @@ func New(client goredis.UniversalClient, opt *Options) *Coordinator {
 //
 // The first caller that acquires SET NX on the lock key becomes the original
 // and executes fn. All other concurrent callers subscribe to the done channel
-// and block. When the original finishes it deletes the lock (via a Lua script
-// to prevent accidental deletion by a different owner) and publishes to the
-// done channel. Waiters then return [dedup.ErrWaitCompleted] so that
-// [dedup.Deduplicator] can fetch the result from [dedup.ResultStore].
+// and block. When the original finishes it publishes to the done channel and
+// deletes the lock (via a Lua script to prevent accidental deletion by a
+// different owner). If the original failed, waiters return the original error;
+// otherwise they return [dedup.ErrWaitCompleted] so that [dedup.Deduplicator]
+// can fetch the result from [dedup.ResultStore].
 func (c *Coordinator) Run(
 	ctx context.Context,
 	key string,
 	fn func(context.Context) (*dedup.Envelope, error),
-) (*dedup.Envelope, error) {
+) (env *dedup.Envelope, err error) {
 	lockKey := c.keyPrefix + key
 	doneCh := c.chanPrefix + key
+	errKey := c.errPrefix + key
 	token := fmt.Sprintf("%d", time.Now().UnixNano())
 
 	acquired, err := c.client.SetNX(ctx, lockKey, token, c.lockTTL).Result()
@@ -99,12 +103,21 @@ func (c *Coordinator) Run(
 
 	if acquired {
 		// This instance is the original.
+		stopRenew := c.renewLock(lockKey, token)
 		defer func() {
+			stopRenew()
+			bg := context.Background()
+			if err != nil {
+				_ = c.client.Set(bg, errKey, err.Error(), c.lockTTL).Err()
+			} else {
+				_ = c.client.Del(bg, errKey).Err()
+			}
+			// Notify all waiters before releasing the lock, so the next
+			// generation of callers cannot consume this completion signal.
+			_ = c.client.Publish(bg, doneCh, "done").Err()
 			// Release lock only if we still own it (Lua CAS).
 			const releaseLua = `if redis.call("GET",KEYS[1])==ARGV[1] then return redis.call("DEL",KEYS[1]) else return 0 end`
-			_ = c.client.Eval(context.Background(), releaseLua, []string{lockKey}, token).Err()
-			// Notify all waiters.
-			_ = c.client.Publish(context.Background(), doneCh, "done").Err()
+			_ = c.client.Eval(bg, releaseLua, []string{lockKey}, token).Err()
 		}()
 		return fn(ctx)
 	}
@@ -129,20 +142,64 @@ func (c *Coordinator) Run(
 
 		case <-ch:
 			// Pub/Sub notification: original finished.
-			return nil, dedup.ErrWaitCompleted
+			return c.completed(ctx, errKey)
 
 		case <-ticker.C:
 			// Fallback poll: if the lock is gone the original has finished
-			// (lock TTL expired or it was released normally).
+			// or the lock was lost after renewal stopped.
 			exists, existsErr := c.client.Exists(ctx, lockKey).Result()
 			if existsErr != nil {
 				return nil, existsErr
 			}
 			if exists == 0 {
-				return nil, dedup.ErrWaitCompleted
+				return c.completed(ctx, errKey)
 			}
 		}
 	}
+}
+
+func (c *Coordinator) renewLock(lockKey, token string) func() {
+	done := make(chan struct{})
+	interval := c.lockTTL / 2
+	if interval <= 0 {
+		interval = c.lockTTL
+	}
+	if interval <= 0 {
+		interval = time.Second
+	}
+
+	ttlMillis := c.lockTTL.Milliseconds()
+	if ttlMillis < 1 {
+		ttlMillis = 1
+	}
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		const renewLua = `if redis.call("GET",KEYS[1])==ARGV[1] then return redis.call("PEXPIRE",KEYS[1],ARGV[2]) else return 0 end`
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				_ = c.client.Eval(context.Background(), renewLua, []string{lockKey}, token, ttlMillis).Err()
+			}
+		}
+	}()
+
+	return func() { close(done) }
+}
+
+func (c *Coordinator) completed(ctx context.Context, errKey string) (*dedup.Envelope, error) {
+	originalErr, err := c.client.Get(ctx, errKey).Result()
+	if err == nil {
+		return nil, errors.New(originalErr)
+	}
+	if errors.Is(err, goredis.Nil) {
+		return nil, dedup.ErrWaitCompleted
+	}
+	return nil, err
 }
 
 // Compile-time interface check.
