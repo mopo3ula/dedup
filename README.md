@@ -242,3 +242,7 @@ Redis coordinator options (`coordinator/redis.Options`):
 
 - Go 1.24+
 - Redis 7+ (only for `coordinator/redis` and `store/redis`)
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
