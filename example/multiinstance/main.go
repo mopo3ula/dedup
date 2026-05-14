@@ -26,7 +26,7 @@ func main() {
 	rdb := goredis.NewClient(&goredis.Options{
 		Addr: "localhost:6379",
 	})
-	defer rdb.Close()
+	defer rdb.Close() //nolint:errcheck
 
 	ctx := context.Background()
 	if err := rdb.Ping(ctx).Err(); err != nil {
