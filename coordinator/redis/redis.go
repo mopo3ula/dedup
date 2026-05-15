@@ -38,17 +38,30 @@ type Options struct {
 	// Prefix is prepended to all Redis keys created by this coordinator.
 	// Default: "dedup".
 	Prefix string
+
+	// OnLockAcquired, if non-nil, is called when this caller wins the SET NX
+	// election and becomes the original (fn will execute next). The coordinatorID
+	// is a unique string that identifies this [Coordinator] instance — useful to
+	// detect unexpected multiple-instance scenarios. Useful for debugging and
+	// metrics (e.g. count how many times the original runs per key).
+	OnLockAcquired func(key, coordinatorID string)
+
+	// OnLockMissed, if non-nil, is called when SET NX fails — this caller is a
+	// duplicate and will wait for the original to finish.
+	OnLockMissed func(key, coordinatorID string)
 }
 
 // Coordinator is a distributed [dedup.Coordinator] that uses Redis SET NX +
 // Pub/Sub to coordinate across multiple service instances.
 type Coordinator struct {
-	client     goredis.UniversalClient
-	lockTTL    time.Duration
-	waitStep   time.Duration
-	keyPrefix  string
-	chanPrefix string
-	errPrefix  string
+	client         goredis.UniversalClient
+	lockTTL        time.Duration
+	waitStep       time.Duration
+	keyPrefix      string
+	chanPrefix     string
+	errPrefix      string
+	onLockAcquired func(key, coordinatorID string)
+	onLockMissed   func(key, coordinatorID string)
 }
 
 // New creates a Coordinator using the provided Redis client.
@@ -59,6 +72,7 @@ func New(client goredis.UniversalClient, opt *Options) *Coordinator {
 		WaitStep: 20 * time.Millisecond,
 		Prefix:   "dedup",
 	}
+	var onAcquired, onMissed func(key, coordinatorID string)
 	if opt != nil {
 		if opt.LockTTL > 0 {
 			cfg.LockTTL = opt.LockTTL
@@ -69,14 +83,18 @@ func New(client goredis.UniversalClient, opt *Options) *Coordinator {
 		if opt.Prefix != "" {
 			cfg.Prefix = opt.Prefix
 		}
+		onAcquired = opt.OnLockAcquired
+		onMissed = opt.OnLockMissed
 	}
 	return &Coordinator{
-		client:     client,
-		lockTTL:    cfg.LockTTL,
-		waitStep:   cfg.WaitStep,
-		keyPrefix:  fmt.Sprintf("%s:lock:", cfg.Prefix),
-		chanPrefix: fmt.Sprintf("%s:done:", cfg.Prefix),
-		errPrefix:  fmt.Sprintf("%s:error:", cfg.Prefix),
+		client:         client,
+		lockTTL:        cfg.LockTTL,
+		waitStep:       cfg.WaitStep,
+		keyPrefix:      fmt.Sprintf("%s:lock:", cfg.Prefix),
+		chanPrefix:     fmt.Sprintf("%s:done:", cfg.Prefix),
+		errPrefix:      fmt.Sprintf("%s:error:", cfg.Prefix),
+		onLockAcquired: onAcquired,
+		onLockMissed:   onMissed,
 	}
 }
 
@@ -99,7 +117,7 @@ func (c *Coordinator) Run(
 	lockKey := c.keyPrefix + key
 	doneCh := c.chanPrefix + key
 	errKey := c.errPrefix + key
-	token := fmt.Sprintf("%d", time.Now().UnixNano())
+	token := fmt.Sprintf("%p:%d", c, time.Now().UnixNano())
 
 	acquired, err := c.client.SetNX(ctx, lockKey, token, c.lockTTL).Result()
 	if err != nil {
@@ -124,10 +142,16 @@ func (c *Coordinator) Run(
 			// Release lock only if we still own it (Lua CAS).
 			_ = c.releaseLock(bg, lockKey, token)
 		}()
+		if c.onLockAcquired != nil {
+			c.onLockAcquired(key, token)
+		}
 		return fn(ctx)
 	}
 
 	// This instance is a duplicate: subscribe and wait.
+	if c.onLockMissed != nil {
+		c.onLockMissed(key, fmt.Sprintf("%p", c))
+	}
 	pubsub := c.client.Subscribe(ctx, doneCh)
 	defer pubsub.Close() //nolint:errcheck
 

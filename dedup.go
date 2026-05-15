@@ -6,6 +6,37 @@ import (
 	"time"
 )
 
+// EventKind identifies the type of internal event emitted by [Deduplicator].
+type EventKind string
+
+const (
+	// EventCacheHit is fired when the fast-path cache lookup returns a result.
+	EventCacheHit EventKind = "cache_hit"
+	// EventCacheMiss is fired when the fast-path cache lookup finds nothing.
+	EventCacheMiss EventKind = "cache_miss"
+	// EventOriginal is fired when this caller becomes the original executor.
+	// fn will be called next.
+	EventOriginal EventKind = "original"
+	// EventInnerCacheHit is fired when the inner (post-lock) cache check
+	// finds a previously stored result, so fn is skipped.
+	EventInnerCacheHit EventKind = "inner_cache_hit"
+	// EventDuplicate is fired when this caller was a duplicate waiter and the
+	// original has now completed.
+	EventDuplicate EventKind = "duplicate"
+)
+
+// Event carries information about a single internal decision made by
+// [Deduplicator.Do]. Attach a handler via [Options.OnEvent] to observe
+// cache hits, coordinator decisions, and fn invocations.
+type Event struct {
+	Kind EventKind
+	Key  string
+	// Err is non-nil only when Kind == EventDuplicate and the original call
+	// failed (the error has already been returned to the caller; this field
+	// is informational only).
+	Err error
+}
+
 // Options configures [Deduplicator] behaviour.
 type Options struct {
 	// ResultTTL controls how long a completed result is kept in [ResultStore].
@@ -17,6 +48,12 @@ type Options struct {
 	// Now overrides the wall clock used to stamp [Envelope.CreatedAt] and to
 	// calculate store TTLs. Useful in tests. Default: time.Now.
 	Now func() time.Time
+
+	// OnEvent, if non-nil, is called synchronously for every notable internal
+	// decision: cache hits/misses, coordinator role (original vs duplicate),
+	// and inner-cache hits that skip fn. Useful for metrics and debugging.
+	// The callback must not block for long; it runs in the caller's goroutine.
+	OnEvent func(e Event)
 }
 
 func (o *Options) withDefaults() Options {
@@ -90,18 +127,44 @@ func (d *Deduplicator) Do(
 
 	// Fast path: result already in store.
 	if cached, err := d.store.Get(ctx, key); err == nil {
+		if d.opt.OnEvent != nil {
+			d.opt.OnEvent(Event{
+				Kind: EventCacheHit,
+				Key:  key,
+			})
+		}
 		return cached.clone(), nil
 	} else if !errors.Is(err, ErrNotFound) {
 		return nil, err
+	}
+
+	if d.opt.OnEvent != nil {
+		d.opt.OnEvent(Event{
+			Kind: EventCacheMiss,
+			Key:  key,
+		})
 	}
 
 	result, err := d.coordinator.Run(ctx, key, func(execCtx context.Context) (*Envelope, error) {
 		// Another goroutine may have stored the result while we were acquiring
 		// the coordinator lock; avoid redundant fn calls.
 		if cached, cacheErr := d.store.Get(execCtx, key); cacheErr == nil {
+			if d.opt.OnEvent != nil {
+				d.opt.OnEvent(Event{
+					Kind: EventInnerCacheHit,
+					Key:  key,
+				})
+			}
 			return cached.clone(), nil
 		} else if !errors.Is(cacheErr, ErrNotFound) {
 			return nil, cacheErr
+		}
+
+		if d.opt.OnEvent != nil {
+			d.opt.OnEvent(Event{
+				Kind: EventOriginal,
+				Key:  key,
+			})
 		}
 
 		res, callErr := fn(execCtx)
@@ -131,6 +194,9 @@ func (d *Deduplicator) Do(
 	cached, fetchErr := d.store.Get(ctx, key)
 	if fetchErr != nil {
 		return nil, fetchErr
+	}
+	if d.opt.OnEvent != nil {
+		d.opt.OnEvent(Event{Kind: EventDuplicate, Key: key})
 	}
 	return cached.clone(), nil
 }
