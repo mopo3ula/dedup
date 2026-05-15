@@ -70,6 +70,9 @@ func (o *Options) withDefaults() Options {
 	if o.Now != nil {
 		opt.Now = o.Now
 	}
+	if o.OnEvent != nil {
+		opt.OnEvent = o.OnEvent
+	}
 	return opt
 }
 
