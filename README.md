@@ -193,55 +193,6 @@ The guarantee depends on these operational assumptions:
   the recovery mechanism; use an idempotent business operation when you need
   end-to-end exactly-once side effects.
 
-
-## Troubleshooting concurrent gRPC tests
-
-If a client test sends five concurrent gRPC requests and the service sometimes
-creates two records instead of one, check these points first:
-
-1. **Same key:** log the exact dedup key in the gRPC handler before calling
-   `Do`. All five calls must produce the same key.
-2. **Shared Redis setup:** in multi-instance deployments, every service instance
-   must use the same Redis coordinator `Prefix` and the same Redis result-store
-   prefix. Using `store/inmemory` per instance allows one execution per process.
-3. **Wrap the side effect:** the database/contact creation must happen inside
-   the `fn` passed to `Do`, not before it.
-4. **Successful caching:** if `fn` creates the contact but then returns an error
-   or `ResultStore.Set` fails, no successful result is cached for later calls.
-5. **Start the client goroutines together:** a `WaitGroup` waits for completion;
-   it does not make goroutines start at the same instant. Use a start barrier
-   when you want to reproduce simultaneous arrivals:
-
-```go
-start := make(chan struct{})
-wg := new(sync.WaitGroup)
-for i := 0; i < 5; i++ {
-    i := i
-    wg.Add(1)
-    go func() {
-        defer wg.Done()
-        <-start
-
-        resp, err := ceClient.ContactCreate(ctx, &contact.CreateContactRequest{
-            User:      "user-123",
-            Contact:   "contact-token-abc",
-            Channel:   "fcm",
-            SsoUserID: core.ValPointer("00000000-0000-0000-0000-000000000000"),
-        })
-        if err != nil {
-            fmt.Printf("i:%d err:%v\n", i, err)
-            return
-        }
-        fmt.Printf("i:%d resp:%s\n", i, resp.GetContact())
-    }()
-}
-close(start)
-wg.Wait()
-```
-
-The `i := i` line is harmless on modern Go and keeps the example correct for
-older Go versions where loop variables were captured by reference.
-
 ## Extending
 
 ### Custom coordinator
