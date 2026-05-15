@@ -149,9 +149,16 @@ func (d *Deduplicator) Do(
 	}
 
 	result, err := d.coordinator.Run(ctx, key, func(execCtx context.Context) (*Envelope, error) {
+		// Store operations use a detached context so that a cancelled or
+		// expired caller context (e.g. gRPC deadline) does not prevent the
+		// result from being written to the store. A failed store.Set would
+		// release the coordinator lock without caching the result, allowing
+		// the next caller to become the new original and execute fn again.
+		storeCtx := context.WithoutCancel(execCtx)
+
 		// Another goroutine may have stored the result while we were acquiring
 		// the coordinator lock; avoid redundant fn calls.
-		if cached, cacheErr := d.store.Get(execCtx, key); cacheErr == nil {
+		if cached, cacheErr := d.store.Get(storeCtx, key); cacheErr == nil {
 			if d.opt.OnEvent != nil {
 				d.opt.OnEvent(Event{
 					Kind: EventInnerCacheHit,
@@ -180,7 +187,7 @@ func (d *Deduplicator) Do(
 
 		res = res.clone()
 		res.CreatedAt = d.opt.Now().UTC()
-		if setErr := d.store.Set(execCtx, key, res, d.opt.ResultTTL); setErr != nil {
+		if setErr := d.store.Set(storeCtx, key, res, d.opt.ResultTTL); setErr != nil {
 			return nil, setErr
 		}
 		return res, nil
@@ -194,7 +201,10 @@ func (d *Deduplicator) Do(
 	}
 
 	// We were a duplicate waiter; the original has stored the result.
-	cached, fetchErr := d.store.Get(ctx, key)
+	// Use a detached context: the caller's context may have been cancelled
+	// by the time we reach this point, but the result is already in the
+	// store so the read must succeed regardless.
+	cached, fetchErr := d.store.Get(context.WithoutCancel(ctx), key)
 	if fetchErr != nil {
 		return nil, fetchErr
 	}

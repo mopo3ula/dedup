@@ -234,7 +234,46 @@ func TestNilEnvelopeWithoutErrorReturnsMeaningfulError(t *testing.T) {
 	}
 }
 
-// BenchmarkHotKeyCached measures the overhead of serving a result that is
+// TestStoreSetWithCancelledContext verifies that cancelling the caller's
+// context after fn returns does not prevent the result from being cached.
+// Before the fix, store.Set used execCtx (the caller's context); if that
+// context was cancelled between fn returning and store.Set running, the
+// result was never cached and the next caller would execute fn again —
+// reproducing the bug where a gRPC deadline fired mid-operation.
+func TestStoreSetWithCancelledContext(t *testing.T) {
+	d := newTestDeduplicator(time.Second)
+	var calls int64
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// First call: context is cancelled inside fn().
+	// The singleflight coordinator may return context.Canceled to this caller,
+	// but fn itself must still complete and cache the result.
+	_, _ = d.Do(ctx, "cancel-key", func(_ context.Context) (*dedup.Envelope, error) {
+		atomic.AddInt64(&calls, 1)
+		cancel() // simulate: gRPC deadline fires while fn is still running
+		return &dedup.Envelope{Payload: []byte("ok")}, nil
+	})
+
+	// Give the background goroutine (singleflight) time to finish storing.
+	time.Sleep(20 * time.Millisecond)
+
+	// Second call with a fresh context: must hit the cache — fn must NOT run again.
+	env, err := d.Do(context.Background(), "cancel-key", func(_ context.Context) (*dedup.Envelope, error) {
+		atomic.AddInt64(&calls, 1)
+		return &dedup.Envelope{Payload: []byte("second")}, nil
+	})
+	if err != nil {
+		t.Fatalf("second Do: unexpected error: %v", err)
+	}
+	if string(env.Payload) != "ok" {
+		t.Fatalf("payload = %q, want \"ok\" (cached result)", string(env.Payload))
+	}
+	if got := atomic.LoadInt64(&calls); got != 1 {
+		t.Fatalf("fn called %d times, want 1 (result must be cached despite context cancellation)", got)
+	}
+}
+
 // already cached in the in-memory store.
 func BenchmarkHotKeyCached(b *testing.B) {
 	d := newTestDeduplicator(time.Minute)
