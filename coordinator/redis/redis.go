@@ -1,9 +1,9 @@
 // Package redis provides a distributed [dedup.Coordinator] backed by Redis.
 //
-// It uses SET NX with a TTL for leader election and Redis Pub/Sub to notify
-// waiting duplicates the moment the original finishes. A check immediately
-// after subscription plus a periodic polling fallback prevent waiters from
-// depending on a single Pub/Sub notification.
+// It uses SET NX with a renewable TTL for leader election and Redis Pub/Sub to
+// notify waiting duplicates the moment the original finishes. A check
+// immediately after subscription plus a periodic polling fallback prevent
+// waiters from depending on a single Pub/Sub notification.
 //
 // Use this coordinator when your service runs as multiple instances that share
 // a Redis cluster. For single-process deployments [coordinator/singleflight]
@@ -22,10 +22,11 @@ import (
 
 // Options configures the Redis coordinator.
 type Options struct {
-	// LockTTL is the maximum time the distributed lock is held. If the
-	// original handler runs longer than this, the lock may expire and a second
-	// instance can start executing the same handler for the same key. Keep this
-	// value comfortably above your worst-case handler latency.
+	// LockTTL is the Redis lock lease duration. The original refreshes the lease
+	// while fn is running; if the process crashes or Redis cannot be reached long
+	// enough for the lease to expire, another instance may acquire the lock and
+	// execute the same handler for the same key. Keep this value comfortably
+	// above short Redis hiccups and scheduler pauses.
 	// Default: 5s.
 	LockTTL time.Duration
 
@@ -82,12 +83,14 @@ func New(client goredis.UniversalClient, opt *Options) *Coordinator {
 // Run implements [dedup.Coordinator].
 //
 // The first caller that acquires SET NX on the lock key becomes the original
-// and executes fn. All other concurrent callers subscribe to the done channel
-// and block. When the original finishes it publishes to the done channel and
-// deletes the lock (via a Lua script to prevent accidental deletion by a
-// different owner). If the original failed, waiters return the original error;
-// otherwise they return [dedup.ErrWaitCompleted] so that [dedup.Deduplicator]
-// can fetch the result from [dedup.ResultStore].
+// and executes fn. While fn is running, the original periodically refreshes the
+// lock lease as long as it still owns the lock. All other concurrent callers
+// subscribe to the done channel and block. When the original finishes it
+// publishes to the done channel and deletes the lock (via a Lua script to
+// prevent accidental deletion by a different owner). If the original failed,
+// waiters return the original error; otherwise they return
+// [dedup.ErrWaitCompleted] so that [dedup.Deduplicator] can fetch the result
+// from [dedup.ResultStore].
 func (c *Coordinator) Run(
 	ctx context.Context,
 	key string,
@@ -105,7 +108,10 @@ func (c *Coordinator) Run(
 
 	if acquired {
 		// This instance is the original.
+		stopRenew := c.renewLock(lockKey, token)
 		defer func() {
+			stopRenew()
+
 			bg := context.Background()
 			if err != nil {
 				_ = c.client.Set(bg, errKey, err.Error(), c.lockTTL).Err()
@@ -116,8 +122,7 @@ func (c *Coordinator) Run(
 			// generation of callers cannot consume this completion signal.
 			_ = c.client.Publish(bg, doneCh, "done").Err()
 			// Release lock only if we still own it (Lua CAS).
-			const releaseLua = `if redis.call("GET",KEYS[1])==ARGV[1] then return redis.call("DEL",KEYS[1]) else return 0 end`
-			_ = c.client.Eval(bg, releaseLua, []string{lockKey}, token).Err()
+			_ = c.releaseLock(bg, lockKey, token)
 		}()
 		return fn(ctx)
 	}
@@ -170,6 +175,54 @@ func (c *Coordinator) Run(
 			}
 		}
 	}
+}
+
+func (c *Coordinator) renewLock(lockKey, token string) func() {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	interval := c.lockTTL / 3
+	if interval <= 0 {
+		interval = c.lockTTL
+	}
+
+	go func() {
+		defer close(done)
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_ = c.extendLock(ctx, lockKey, token)
+			}
+		}
+	}()
+
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
+func (c *Coordinator) extendLock(ctx context.Context, lockKey, token string) error {
+	const extendLua = `if redis.call("GET",KEYS[1])==ARGV[1] then return redis.call("PEXPIRE",KEYS[1],ARGV[2]) else return 0 end`
+	return c.client.Eval(ctx, extendLua, []string{lockKey}, token, c.lockTTLMillis()).Err()
+}
+
+func (c *Coordinator) lockTTLMillis() int64 {
+	millis := c.lockTTL.Milliseconds()
+	if millis <= 0 {
+		return 1
+	}
+	return millis
+}
+
+func (c *Coordinator) releaseLock(ctx context.Context, lockKey, token string) error {
+	const releaseLua = `if redis.call("GET",KEYS[1])==ARGV[1] then return redis.call("DEL",KEYS[1]) else return 0 end`
+	return c.client.Eval(ctx, releaseLua, []string{lockKey}, token).Err()
 }
 
 func (c *Coordinator) originalFinished(ctx context.Context, lockKey string) (bool, error) {

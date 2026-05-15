@@ -182,14 +182,65 @@ The guarantee depends on these operational assumptions:
 - All duplicates must use the same stable key for the same logical request.
 - Multi-instance deployments must share the same Redis coordinator prefix and
   Redis-backed result store prefix.
-- `coordinator/redis.Options.LockTTL` must be comfortably longer than the
-  worst-case handler runtime. If the lock expires while the original is still
-  running, another caller can acquire a new lock and execute `fn` again.
+- `coordinator/redis.Options.LockTTL` is a renewable Redis lease, not a hard
+  limit on handler runtime. It must be long enough to survive short Redis
+  hiccups and scheduler pauses between renewals. If the process crashes or the
+  lease cannot be renewed until it expires, another caller can acquire the lock
+  and execute `fn` again.
 - If the original returns an error, its error is propagated to waiters and no
   successful result is cached.
 - If a process crashes or loses Redis connectivity mid-flight, the lock TTL is
   the recovery mechanism; use an idempotent business operation when you need
   end-to-end exactly-once side effects.
+
+
+## Troubleshooting concurrent gRPC tests
+
+If a client test sends five concurrent gRPC requests and the service sometimes
+creates two records instead of one, check these points first:
+
+1. **Same key:** log the exact dedup key in the gRPC handler before calling
+   `Do`. All five calls must produce the same key.
+2. **Shared Redis setup:** in multi-instance deployments, every service instance
+   must use the same Redis coordinator `Prefix` and the same Redis result-store
+   prefix. Using `store/inmemory` per instance allows one execution per process.
+3. **Wrap the side effect:** the database/contact creation must happen inside
+   the `fn` passed to `Do`, not before it.
+4. **Successful caching:** if `fn` creates the contact but then returns an error
+   or `ResultStore.Set` fails, no successful result is cached for later calls.
+5. **Start the client goroutines together:** a `WaitGroup` waits for completion;
+   it does not make goroutines start at the same instant. Use a start barrier
+   when you want to reproduce simultaneous arrivals:
+
+```go
+start := make(chan struct{})
+wg := new(sync.WaitGroup)
+for i := 0; i < 5; i++ {
+    i := i
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        <-start
+
+        resp, err := ceClient.ContactCreate(ctx, &contact.CreateContactRequest{
+            User:      "2781731782578",
+            Contact:   "f0320i8nRpS3202Vgbv8q9:111111111111111111111111114",
+            Channel:   "fcm",
+            SsoUserID: core.ValPointer("38862f89-ed79-455f-ac0c-3bbcc64234a4"),
+        })
+        if err != nil {
+            fmt.Printf("i:%d err:%v\n", i, err)
+            return
+        }
+        fmt.Printf("i:%d resp:%s\n", i, resp.GetContact())
+    }()
+}
+close(start)
+wg.Wait()
+```
+
+The `i := i` line is harmless on modern Go and keeps the example correct for
+older Go versions where loop variables were captured by reference.
 
 ## Extending
 
@@ -273,7 +324,7 @@ Redis coordinator options (`coordinator/redis.Options`):
 
 | Option     | Default   | Description                                                            |
 |------------|-----------|------------------------------------------------------------------------|
-| `LockTTL`  | `5s`      | Max time the distributed lock is held. Must exceed worst-case handler latency to avoid a second execution while the original is still running. |
+| `LockTTL`  | `5s`      | Redis lock lease duration. The original renews it while `fn` runs; choose a value long enough for short Redis hiccups and scheduler pauses. |
 | `WaitStep` | `20ms`    | Polling interval for the fallback lock-exists check.                   |
 | `Prefix`   | `"dedup"` | Redis key namespace.                                                   |
 

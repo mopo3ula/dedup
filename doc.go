@@ -16,12 +16,14 @@
 // distributed lock. In multi-instance deployments, every instance must share
 // the same Redis coordinator namespace and result-store namespace.
 //
-// For the Redis coordinator, [coordinator/redis.Options.LockTTL] must be longer
-// than the worst-case handler runtime. If the lock expires while the original
-// is still running, another caller can acquire a new lock and execute the
-// handler again. The package deduplicates request handling; it does not by
-// itself provide end-to-end exactly-once side effects across process crashes,
-// Redis outages, or non-idempotent upstream operations.
+// For the Redis coordinator, [coordinator/redis.Options.LockTTL] is a renewable
+// Redis lease, not a hard limit on handler runtime. It must be long enough to
+// survive short Redis hiccups and scheduler pauses between renewals. If the
+// process crashes or the lease cannot be renewed until it expires, another
+// caller can acquire the lock and execute the handler again. The package
+// deduplicates request handling; it does not by itself provide end-to-end
+// exactly-once side effects across process crashes, Redis outages, or
+// non-idempotent upstream operations.
 //
 // # Core abstractions
 //
