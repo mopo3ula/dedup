@@ -223,10 +223,10 @@ for i := 0; i < 5; i++ {
         <-start
 
         resp, err := ceClient.ContactCreate(ctx, &contact.CreateContactRequest{
-            User:      "2781731782578",
-            Contact:   "f0320i8nRpS3202Vgbv8q9:111111111111111111111111114",
+            User:      "user-123",
+            Contact:   "contact-token-abc",
             Channel:   "fcm",
-            SsoUserID: core.ValPointer("38862f89-ed79-455f-ac0c-3bbcc64234a4"),
+            SsoUserID: core.ValPointer("00000000-0000-0000-0000-000000000000"),
         })
         if err != nil {
             fmt.Printf("i:%d err:%v\n", i, err)
