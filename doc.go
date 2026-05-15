@@ -2,11 +2,26 @@
 //
 // # Overview
 //
-// When multiple identical requests arrive concurrently, only the first one
-// (the "original") is executed. All duplicates block until the original
-// finishes and receive exactly the same [Envelope]. Subsequent requests
-// within the ResultTTL window are served instantly from the [ResultStore]
-// without invoking the handler again.
+// When multiple identical requests with the same deduplication key arrive
+// concurrently, one caller becomes the "original" and executes the handler.
+// Duplicates block until the original finishes and receive the same [Envelope].
+// Subsequent requests within the ResultTTL window are served instantly from the
+// [ResultStore] without invoking the handler again.
+//
+// # Guarantees and limits
+//
+// Deduplication is based on the key and the selected coordinator, not on wall
+// clock timestamp comparison. Calls that arrive nanoseconds apart with the same
+// key are coalesced by the in-process singleflight group or by the Redis SET NX
+// distributed lock. In multi-instance deployments, every instance must share
+// the same Redis coordinator namespace and result-store namespace.
+//
+// For the Redis coordinator, [coordinator/redis.Options.LockTTL] must be longer
+// than the worst-case handler runtime. If the lock expires while the original
+// is still running, another caller can acquire a new lock and execute the
+// handler again. The package deduplicates request handling; it does not by
+// itself provide end-to-end exactly-once side effects across process crashes,
+// Redis outages, or non-idempotent upstream operations.
 //
 // # Core abstractions
 //

@@ -1,10 +1,11 @@
 # dedup
 
 Transparent request deduplication for Go services.
-When multiple identical requests arrive concurrently, only the **first** one
-is executed. All duplicates block and receive **the same result** the moment
-the original finishes. Subsequent requests within the TTL window are answered
-**instantly from cache** — the handler is never called again.
+When multiple identical requests with the same deduplication key arrive
+concurrently, only one request becomes the **original** and executes the
+handler. All duplicates block and receive **the same result** the moment the
+original finishes. Subsequent requests within the TTL window are answered
+**instantly from cache** — the handler is not called again.
 
 ## Features
 
@@ -153,11 +154,42 @@ Request C ──► Do(ctx, key, fn) ──► ResultStore.Get ─────�
 5. **C** arrives after **A** finishes → `ResultStore.Get` returns immediately (within TTL).
 
 Correctness does not rely on artificial sleeps or millisecond-sized gaps between
-requests: callers that arrive nanoseconds apart are coordinated by the lock, not
-by timestamp comparison. With the Redis coordinator, duplicate waiters also
-re-check the lock immediately after subscribing so a completion published in the
-tiny subscribe race window is still observed without waiting for the polling
-fallback.
+requests: callers that arrive nanoseconds apart are coordinated by the
+coordinator's lock/singleflight primitive, not by timestamp comparison. This was
+already the core behaviour for simultaneous calls with the same key; the Redis
+coordinator additionally re-checks the lock immediately after subscribing so a
+completion published in the tiny subscribe race window is observed without
+waiting for the polling fallback.
+
+## Guarantees and limits
+
+For a given deduplication key, `dedup` coalesces concurrent calls as follows:
+
+- **Single process:** `coordinator/singleflight` makes one in-flight caller run
+  `fn`; duplicate callers in the same process wait for that result.
+- **Multiple instances:** `coordinator/redis` uses Redis `SET NX` as a shared
+  distributed lock, so all instances that use the same Redis client namespace
+  compete for one original caller.
+- **After success:** the original stores the completed `Envelope` in
+  `ResultStore`, and calls arriving within `ResultTTL` are served from cache.
+- **Nanosecond-close arrivals:** if five requests with the same key enter
+  `Do` at effectively the same time, one becomes the original and the other
+  four wait/read the stored result; the handler is not selected by comparing
+  timestamps.
+
+The guarantee depends on these operational assumptions:
+
+- All duplicates must use the same stable key for the same logical request.
+- Multi-instance deployments must share the same Redis coordinator prefix and
+  Redis-backed result store prefix.
+- `coordinator/redis.Options.LockTTL` must be comfortably longer than the
+  worst-case handler runtime. If the lock expires while the original is still
+  running, another caller can acquire a new lock and execute `fn` again.
+- If the original returns an error, its error is propagated to waiters and no
+  successful result is cached.
+- If a process crashes or loses Redis connectivity mid-flight, the lock TTL is
+  the recovery mechanism; use an idempotent business operation when you need
+  end-to-end exactly-once side effects.
 
 ## Extending
 
@@ -241,7 +273,7 @@ Redis coordinator options (`coordinator/redis.Options`):
 
 | Option     | Default   | Description                                                            |
 |------------|-----------|------------------------------------------------------------------------|
-| `LockTTL`  | `5s`      | Max time the distributed lock is held. Must exceed worst-case latency. |
+| `LockTTL`  | `5s`      | Max time the distributed lock is held. Must exceed worst-case handler latency to avoid a second execution while the original is still running. |
 | `WaitStep` | `20ms`    | Polling interval for the fallback lock-exists check.                   |
 | `Prefix`   | `"dedup"` | Redis key namespace.                                                   |
 

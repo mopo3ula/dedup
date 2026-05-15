@@ -1,8 +1,9 @@
 // Package redis provides a distributed [dedup.Coordinator] backed by Redis.
 //
 // It uses SET NX with a TTL for leader election and Redis Pub/Sub to notify
-// waiting duplicates the moment the original finishes. A periodic polling
-// fallback ensures correctness even if a Pub/Sub message is lost.
+// waiting duplicates the moment the original finishes. A check immediately
+// after subscription plus a periodic polling fallback prevent waiters from
+// depending on a single Pub/Sub notification.
 //
 // Use this coordinator when your service runs as multiple instances that share
 // a Redis cluster. For single-process deployments [coordinator/singleflight]
@@ -22,9 +23,9 @@ import (
 // Options configures the Redis coordinator.
 type Options struct {
 	// LockTTL is the maximum time the distributed lock is held. If the
-	// original handler runs longer than this the lock may expire and a second
-	// instance could start executing. Keep this value comfortably above your
-	// expected handler latency.
+	// original handler runs longer than this, the lock may expire and a second
+	// instance can start executing the same handler for the same key. Keep this
+	// value comfortably above your worst-case handler latency.
 	// Default: 5s.
 	LockTTL time.Duration
 
