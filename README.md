@@ -152,6 +152,13 @@ Request C ──► Do(ctx, key, fn) ──► ResultStore.Get ─────�
 4. **B** wakes up, reads result from `ResultStore`, returns the same `Envelope`.
 5. **C** arrives after **A** finishes → `ResultStore.Get` returns immediately (within TTL).
 
+Correctness does not rely on artificial sleeps or millisecond-sized gaps between
+requests: callers that arrive nanoseconds apart are coordinated by the lock, not
+by timestamp comparison. With the Redis coordinator, duplicate waiters also
+re-check the lock immediately after subscribing so a completion published in the
+tiny subscribe race window is still observed without waiting for the polling
+fallback.
+
 ## Extending
 
 ### Custom coordinator

@@ -130,6 +130,20 @@ func (c *Coordinator) Run(
 		return nil, err
 	}
 
+	// The original may finish in the tiny window between our failed SET NX
+	// attempt and the moment the subscription becomes active. Pub/Sub would not
+	// replay that already-published message, so check the lock immediately after
+	// subscribing before falling back to ticker-based polling. This keeps
+	// nanosecond-close duplicate arrivals from waiting for WaitStep just because
+	// they missed the notification.
+	finished, err := c.originalFinished(ctx, lockKey)
+	if err != nil {
+		return nil, err
+	}
+	if finished {
+		return c.completed(ctx, errKey)
+	}
+
 	ch := pubsub.Channel()
 	ticker := time.NewTicker(c.waitStep)
 	defer ticker.Stop()
@@ -146,15 +160,23 @@ func (c *Coordinator) Run(
 		case <-ticker.C:
 			// Fallback poll: if the lock is gone the original has finished
 			// (lock TTL expired or it was released normally).
-			exists, existsErr := c.client.Exists(ctx, lockKey).Result()
+			finished, existsErr := c.originalFinished(ctx, lockKey)
 			if existsErr != nil {
 				return nil, existsErr
 			}
-			if exists == 0 {
+			if finished {
 				return c.completed(ctx, errKey)
 			}
 		}
 	}
+}
+
+func (c *Coordinator) originalFinished(ctx context.Context, lockKey string) (bool, error) {
+	exists, err := c.client.Exists(ctx, lockKey).Result()
+	if err != nil {
+		return false, err
+	}
+	return exists == 0, nil
 }
 
 func (c *Coordinator) completed(ctx context.Context, errKey string) (*dedup.Envelope, error) {
