@@ -64,6 +64,80 @@ func TestDeduplicatesConcurrentCalls(t *testing.T) {
 	}
 }
 
+// TestDeduplicatesNanosecondCloseCalls verifies that correctness does not
+// depend on requests being separated by scheduler-scale delays. A duplicate
+// that starts one nanosecond after the original still waits for the original
+// and receives its result instead of executing the handler again.
+func TestDeduplicatesNanosecondCloseCalls(t *testing.T) {
+	d := newTestDeduplicator(time.Second)
+
+	var originCalls int64
+	started := make(chan struct{})
+	release := make(chan struct{})
+	handler := func(ctx context.Context) (*dedup.Envelope, error) {
+		if atomic.AddInt64(&originCalls, 1) == 1 {
+			close(started)
+		}
+		select {
+		case <-release:
+			return &dedup.Envelope{Payload: []byte("ok")}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	type callResult struct {
+		payload string
+		err     error
+	}
+	results := make(chan callResult, 2)
+
+	go func() {
+		env, err := d.Do(context.Background(), "nanosecond-key", handler)
+		if err != nil {
+			results <- callResult{err: err}
+			return
+		}
+		results <- callResult{payload: string(env.Payload)}
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not start")
+	}
+	time.Sleep(time.Nanosecond)
+
+	go func() {
+		env, err := d.Do(context.Background(), "nanosecond-key", handler)
+		if err != nil {
+			results <- callResult{err: err}
+			return
+		}
+		results <- callResult{payload: string(env.Payload)}
+	}()
+
+	close(release)
+
+	for range 2 {
+		select {
+		case res := <-results:
+			if res.err != nil {
+				t.Fatalf("unexpected error: %v", res.err)
+			}
+			if res.payload != "ok" {
+				t.Fatalf("payload = %q, want ok", res.payload)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for calls")
+		}
+	}
+
+	if got := atomic.LoadInt64(&originCalls); got != 1 {
+		t.Fatalf("handler called %d times, want exactly 1", got)
+	}
+}
+
 // TestCachedResultReturnedImmediately verifies that a second call with the
 // same key after the original finishes is served from cache without calling
 // the handler again and returns in well under 1 ms.
