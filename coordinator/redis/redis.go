@@ -27,6 +27,8 @@ import (
 // to publish as the ordinary successful completion for the key.
 var ErrLockLost = errors.New("dedup redis: lock ownership lost")
 
+const errLockLostMarker = "dedup:redis:error:lock_lost"
+
 // Options configures the Redis coordinator.
 type Options struct {
 	// LockTTL is the Redis lock lease duration. The original refreshes the lease
@@ -144,14 +146,17 @@ func (c *Coordinator) Run(
 				if renewal.lost() {
 					env = nil
 					err = ErrLockLost
-				} else if extendErr := c.extendLock(bg, lockKey, token); extendErr != nil {
+				} else if extendResult, extendErr := c.extendLock(bg, lockKey, token); extendErr != nil {
 					env = nil
 					err = extendErr
+				} else if extendResult == extendLockLost {
+					env = nil
+					err = ErrLockLost
 				}
 			}
 
 			if err != nil {
-				_ = c.client.Set(bg, errKey, err.Error(), c.lockTTL).Err()
+				_ = c.client.Set(bg, errKey, encodeCompletionError(err), c.lockTTL).Err()
 			} else {
 				_ = c.client.Del(bg, errKey).Err()
 			}
@@ -264,8 +269,11 @@ func (c *Coordinator) renewLock(lockKey, token string) *lockRenewal {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				err := c.extendLock(ctx, lockKey, token)
-				if errors.Is(err, ErrLockLost) {
+				result, err := c.extendLock(ctx, lockKey, token)
+				if err != nil {
+					continue
+				}
+				if result == extendLockLost {
 					renewal.markLost()
 					return
 				}
@@ -276,16 +284,23 @@ func (c *Coordinator) renewLock(lockKey, token string) *lockRenewal {
 	return renewal
 }
 
-func (c *Coordinator) extendLock(ctx context.Context, lockKey, token string) error {
+type extendLockResult uint8
+
+const (
+	extendLockLost extendLockResult = iota
+	extendLockExtended
+)
+
+func (c *Coordinator) extendLock(ctx context.Context, lockKey, token string) (extendLockResult, error) {
 	const extendLua = `if redis.call("GET",KEYS[1])==ARGV[1] then return redis.call("PEXPIRE",KEYS[1],ARGV[2]) else return 0 end`
 	result, err := c.client.Eval(ctx, extendLua, []string{lockKey}, token, c.lockTTLMillis()).Int64()
 	if err != nil {
-		return err
+		return extendLockLost, err
 	}
 	if result != 1 {
-		return ErrLockLost
+		return extendLockLost, nil
 	}
-	return nil
+	return extendLockExtended, nil
 }
 
 func (c *Coordinator) lockTTLMillis() int64 {
@@ -312,10 +327,7 @@ func (c *Coordinator) originalFinished(ctx context.Context, lockKey string) (boo
 func (c *Coordinator) completed(ctx context.Context, errKey string) (*dedup.Envelope, error) {
 	originalErr, err := c.client.Get(ctx, errKey).Result()
 	if err == nil {
-		if originalErr == ErrLockLost.Error() {
-			return nil, ErrLockLost
-		}
-		return nil, errors.New(originalErr)
+		return nil, decodeCompletionError(originalErr)
 	}
 	if errors.Is(err, goredis.Nil) {
 		return nil, dedup.ErrWaitCompleted
@@ -325,3 +337,17 @@ func (c *Coordinator) completed(ctx context.Context, errKey string) (*dedup.Enve
 
 // Compile-time interface check.
 var _ dedup.Coordinator = (*Coordinator)(nil)
+
+func encodeCompletionError(err error) string {
+	if errors.Is(err, ErrLockLost) {
+		return errLockLostMarker
+	}
+	return err.Error()
+}
+
+func decodeCompletionError(value string) error {
+	if value == errLockLostMarker {
+		return ErrLockLost
+	}
+	return errors.New(value)
+}
