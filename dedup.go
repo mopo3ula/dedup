@@ -114,8 +114,9 @@ func New(store ResultStore, coordinator Coordinator, opt *Options) *Deduplicator
 //   - Otherwise fn is executed as the "original", its result is stored in
 //     [ResultStore], and returned.
 //
-// fn receives a context derived from ctx. Cancelling ctx interrupts duplicate
-// waiters but does not abort an already-running original.
+// fn receives a context derived from ctx that preserves ctx values while
+// ignoring ctx cancellation. Cancelling ctx interrupts duplicate waiters but
+// does not abort an already-running original.
 //
 // The returned [Envelope] is always a fresh deep copy; callers may mutate it
 // freely without affecting cached data.
