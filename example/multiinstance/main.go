@@ -36,7 +36,7 @@ func main() {
 	// Create a Deduplicator with a Redis store and Redis coordinator.
 	// All application instances sharing the same Redis will share the result
 	// cache and the distributed lock.
-	d := dedup.New(
+	d, err := dedup.New(
 		redistore.New(rdb, "myapp:result:"),
 		rediscoord.New(rdb, &rediscoord.Options{
 			LockTTL: 10 * time.Second, // maximum expected handler duration
@@ -44,6 +44,9 @@ func main() {
 		}),
 		&dedup.Options{ResultTTL: 30 * time.Second},
 	)
+	if err != nil {
+		panic(err)
+	}
 
 	// --- Example 1: concurrent requests with the same key ---
 	fmt.Println("=== Example 1: 5 concurrent requests with key 'order:42' ===")

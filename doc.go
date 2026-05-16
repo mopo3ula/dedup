@@ -48,20 +48,26 @@
 //
 // Single process (no external dependencies):
 //
-//	d := dedup.New(
+//	d, err := dedup.New(
 //	    inmemory.New(),
 //	    singleflight.New(),
 //	    &dedup.Options{ResultTTL: 30 * time.Second},
 //	)
+//	if err != nil {
+//	    return err
+//	}
 //
 // Multi-instance (shared Redis):
 //
 //	rdb := goredis.NewClient(&goredis.Options{Addr: "127.0.0.1:6379"})
-//	d := dedup.New(
+//	d, err := dedup.New(
 //	    redistore.New(rdb, "myapp:result:"),
 //	    rediscoord.New(rdb, nil),
 //	    &dedup.Options{ResultTTL: 30 * time.Second},
 //	)
+//	if err != nil {
+//	    return err
+//	}
 //
 // Both variants expose the same [Deduplicator.Do] API — switching is a one-line
 // change in the initialisation code.

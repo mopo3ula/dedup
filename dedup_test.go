@@ -15,7 +15,92 @@ import (
 
 // newTestDeduplicator creates a Deduplicator with in-process implementations.
 func newTestDeduplicator(ttl time.Duration) *dedup.Deduplicator {
-	return dedup.New(memstore.New(), sfcoord.New(), &dedup.Options{ResultTTL: ttl})
+	return dedup.MustNew(memstore.New(), sfcoord.New(), &dedup.Options{ResultTTL: ttl})
+}
+
+func TestNewReturnsErrorOnNilStore(t *testing.T) {
+	d, err := dedup.New(nil, sfcoord.New(), nil)
+	if d != nil {
+		t.Fatalf("deduplicator = %#v, want nil", d)
+	}
+	if !errors.Is(err, dedup.ErrNilResultStore) {
+		t.Fatalf("error = %v, want %v", err, dedup.ErrNilResultStore)
+	}
+}
+
+func TestNewReturnsErrorOnNilCoordinator(t *testing.T) {
+	d, err := dedup.New(memstore.New(), nil, nil)
+	if d != nil {
+		t.Fatalf("deduplicator = %#v, want nil", d)
+	}
+	if !errors.Is(err, dedup.ErrNilCoordinator) {
+		t.Fatalf("error = %v, want %v", err, dedup.ErrNilCoordinator)
+	}
+}
+
+func TestNewReturnsErrorOnTypedNilDependencies(t *testing.T) {
+	var store *memstore.Store
+	d, err := dedup.New(store, sfcoord.New(), nil)
+	if d != nil {
+		t.Fatalf("deduplicator = %#v, want nil", d)
+	}
+	if !errors.Is(err, dedup.ErrNilResultStore) {
+		t.Fatalf("error = %v, want %v", err, dedup.ErrNilResultStore)
+	}
+
+	var coordinator *sfcoord.Coordinator
+	d, err = dedup.New(memstore.New(), coordinator, nil)
+	if d != nil {
+		t.Fatalf("deduplicator = %#v, want nil", d)
+	}
+	if !errors.Is(err, dedup.ErrNilCoordinator) {
+		t.Fatalf("error = %v, want %v", err, dedup.ErrNilCoordinator)
+	}
+}
+
+func TestMustNewPanicsOnNilDependency(t *testing.T) {
+	assertPanicError(t, dedup.ErrNilResultStore, func() {
+		dedup.MustNew(nil, sfcoord.New(), nil)
+	})
+}
+
+func TestNilHandlerReturnsMeaningfulError(t *testing.T) {
+	d := newTestDeduplicator(time.Second)
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Do panicked: %v", r)
+		}
+	}()
+
+	_, err := d.Do(context.Background(), "nil-handler", nil)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	if !errors.Is(err, dedup.ErrNilHandler) {
+		t.Fatalf("error = %v, want %v", err, dedup.ErrNilHandler)
+	}
+}
+
+func assertPanicError(t *testing.T, want error, fn func()) {
+	t.Helper()
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatalf("expected panic %v, got nil", want)
+		}
+		got, ok := r.(error)
+		if !ok {
+			t.Fatalf("panic = %#v, want error %v", r, want)
+		}
+		if !errors.Is(got, want) {
+			t.Fatalf("panic = %v, want %v", got, want)
+		}
+	}()
+
+	fn()
 }
 
 // TestDeduplicatesConcurrentCalls verifies that when N goroutines call Do with

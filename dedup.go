@@ -3,6 +3,7 @@ package dedup
 import (
 	"context"
 	"errors"
+	"reflect"
 	"time"
 )
 
@@ -79,32 +80,61 @@ func (o *Options) withDefaults() Options {
 // Deduplicator deduplicates concurrent identical requests.
 //
 // Create one with [New] and call [Deduplicator.Do] from your request handler.
-// The zero value is not usable; always use [New].
+// The zero value is not usable; always use [New] or [MustNew].
 type Deduplicator struct {
 	store       ResultStore
 	coordinator Coordinator
 	opt         Options
 }
 
+var (
+	// ErrNilResultStore is returned by [New] when store is nil.
+	ErrNilResultStore = errors.New("dedup: nil ResultStore")
+	// ErrNilCoordinator is returned by [New] when coordinator is nil.
+	ErrNilCoordinator = errors.New("dedup: nil Coordinator")
+	// ErrNilHandler is returned by [Deduplicator.Do] when fn is nil.
+	ErrNilHandler = errors.New("dedup: nil handler")
+)
+
 // New creates a [Deduplicator] backed by the provided [ResultStore] and
 // [Coordinator]. opt may be nil; defaults are used in that case.
+// It returns an error if store or coordinator is nil.
 //
 // Typical combinations:
 //
 //	// Single-process deployment
-//	dedup.New(inmemory.New(), singleflight.New(), nil)
+//	d, err := dedup.New(inmemory.New(), singleflight.New(), nil)
 //
 //	// Multi-instance deployment (Redis required)
-//	dedup.New(redistore.New(rdb, "prefix:"), rediscoord.New(rdb, nil), nil)
-func New(store ResultStore, coordinator Coordinator, opt *Options) *Deduplicator {
+//	d, err := dedup.New(redistore.New(rdb, "prefix:"), rediscoord.New(rdb, nil), nil)
+func New(store ResultStore, coordinator Coordinator, opt *Options) (*Deduplicator, error) {
+	if isNilDependency(store) {
+		return nil, ErrNilResultStore
+	}
+	if isNilDependency(coordinator) {
+		return nil, ErrNilCoordinator
+	}
+
 	return &Deduplicator{
 		store:       store,
 		coordinator: coordinator,
 		opt:         opt.withDefaults(),
+	}, nil
+}
+
+// MustNew is like [New], but panics if the deduplicator cannot be created.
+// Use MustNew only when nil dependencies are a programmer error that should
+// stop the process during startup.
+func MustNew(store ResultStore, coordinator Coordinator, opt *Options) *Deduplicator {
+	d, err := New(store, coordinator, opt)
+	if err != nil {
+		panic(err)
 	}
+	return d
 }
 
 // Do executes fn at most once per key within the [Options.ResultTTL] window.
+// It returns an error if key is empty or fn is nil.
 //
 // Behaviour:
 //   - If a result for key is already cached in [ResultStore], it is returned
@@ -125,6 +155,9 @@ func (d *Deduplicator) Do(
 	key string,
 	fn func(context.Context) (*Envelope, error),
 ) (*Envelope, error) {
+	if fn == nil {
+		return nil, ErrNilHandler
+	}
 	if key == "" {
 		return nil, errors.New("dedup: key is empty")
 	}
@@ -213,4 +246,18 @@ func (d *Deduplicator) Do(
 		d.opt.OnEvent(Event{Kind: EventDuplicate, Key: key})
 	}
 	return cached.clone(), nil
+}
+
+func isNilDependency(v any) bool {
+	if v == nil {
+		return true
+	}
+
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return rv.IsNil()
+	default:
+		return false
+	}
 }
