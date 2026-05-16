@@ -139,3 +139,67 @@ func TestWaiterCancellationDoesNotCancelAlreadyRunningOriginal(t *testing.T) {
 		t.Fatalf("duplicate fn called %d times, want 0", got)
 	}
 }
+
+func TestRunReturnsLockLostAndDoesNotPublishCompletionWhenRenewalLosesOwnership(t *testing.T) {
+	client := newIntegrationClient(t)
+	prefix := fmt.Sprintf("dedup-test:%d:lock-lost", time.Now().UnixNano())
+	const key = "shared-key"
+
+	lockTTL := 90 * time.Millisecond
+	coord := New(client, &Options{
+		Prefix:   prefix,
+		LockTTL:  lockTTL,
+		WaitStep: 5 * time.Millisecond,
+	})
+
+	ctx := context.Background()
+	lockKey := coord.keyPrefix + key
+	doneCh := coord.chanPrefix + key
+	pubsub := client.Subscribe(ctx, doneCh)
+	defer pubsub.Close() //nolint:errcheck
+	if _, err := pubsub.Receive(ctx); err != nil {
+		t.Fatalf("Subscribe %q: %v", doneCh, err)
+	}
+
+	started := make(chan struct{})
+	finish := make(chan struct{})
+	runDone := make(chan error, 1)
+	go func() {
+		_, err := coord.Run(ctx, key, func(context.Context) (*dedup.Envelope, error) {
+			close(started)
+			<-finish
+			return &dedup.Envelope{Payload: []byte("unsafe")}, nil
+		})
+		runDone <- err
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("original did not start")
+	}
+
+	if err := client.Set(ctx, lockKey, "replacement-token", time.Second).Err(); err != nil {
+		t.Fatalf("replace lock token: %v", err)
+	}
+
+	// Give the renewer enough time to run at least once after the token was
+	// replaced. Its next CAS extension must observe a miss and record lock loss.
+	time.Sleep(lockTTL)
+	close(finish)
+
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, ErrLockLost) {
+			t.Fatalf("Run error = %v, want %v", err, ErrLockLost)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("original did not return after release")
+	}
+
+	select {
+	case msg := <-pubsub.Channel():
+		t.Fatalf("unexpected completion publication after lock loss: %q", msg.Payload)
+	case <-time.After(2 * lockTTL):
+	}
+}

@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/mopo3ula/dedup"
@@ -50,6 +51,12 @@ type Options struct {
 	// duplicate and will wait for the original to finish.
 	OnLockMissed func(key, coordinatorID string)
 }
+
+// ErrLockLost is returned by [Coordinator.Run] when the original executor
+// detects that it no longer owns its Redis lock while fn is running. In that
+// state the returned result is unsafe to publish because another executor may
+// have acquired the same key and started a newer generation of work.
+var ErrLockLost = errors.New("dedup redis: lock ownership lost")
 
 // Coordinator is a distributed [dedup.Coordinator] that uses Redis SET NX +
 // Pub/Sub to coordinate across multiple service instances.
@@ -106,8 +113,10 @@ func New(client goredis.UniversalClient, opt *Options) *Coordinator {
 // lock lease as long as it still owns the lock. All other concurrent callers
 // subscribe to the done channel and block. When the original finishes it
 // publishes to the done channel and deletes the lock (via a Lua script to
-// prevent accidental deletion by a different owner). If the original failed,
-// waiters return the original error; otherwise they return
+// prevent accidental deletion by a different owner). If lock renewal detects
+// that another owner has replaced or removed the lock before fn returns, Run
+// returns [ErrLockLost] and does not publish a normal completion signal. If
+// the original failed, waiters return the original error; otherwise they return
 // [dedup.ErrWaitCompleted] so that [dedup.Deduplicator] can fetch the result
 // from [dedup.ResultStore].
 func (c *Coordinator) Run(
@@ -127,9 +136,13 @@ func (c *Coordinator) Run(
 
 	if acquired {
 		// This instance is the original.
-		stopRenew := c.renewLock(lockKey, token)
+		renewal := c.renewLock(lockKey, token)
 		defer func() {
-			stopRenew()
+			lockLost := renewal.stop()
+			if lockLost {
+				err = ErrLockLost
+				return
+			}
 
 			bg := context.Background()
 			if err != nil {
@@ -146,7 +159,8 @@ func (c *Coordinator) Run(
 		if c.onLockAcquired != nil {
 			c.onLockAcquired(key, token)
 		}
-		return fn(context.WithoutCancel(ctx))
+		env, err = fn(context.WithoutCancel(ctx))
+		return env, err
 	}
 
 	// This instance is a duplicate: subscribe and wait.
@@ -202,16 +216,38 @@ func (c *Coordinator) Run(
 	}
 }
 
-func (c *Coordinator) renewLock(lockKey, token string) func() {
+type lockRenewal struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+	lost   atomic.Bool
+}
+
+func (r *lockRenewal) stop() bool {
+	r.cancel()
+	<-r.done
+	return r.lost.Load()
+}
+
+type extendLockResult int
+
+const (
+	extendLockSucceeded extendLockResult = iota
+	extendLockLost
+)
+
+func (c *Coordinator) renewLock(lockKey, token string) *lockRenewal {
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
+	renewal := &lockRenewal{
+		cancel: cancel,
+		done:   make(chan struct{}),
+	}
 	interval := c.lockTTL / 3
 	if interval <= 0 {
 		interval = c.lockTTL
 	}
 
 	go func() {
-		defer close(done)
+		defer close(renewal.done)
 
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -221,20 +257,31 @@ func (c *Coordinator) renewLock(lockKey, token string) func() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				_ = c.extendLock(ctx, lockKey, token)
+				result, err := c.extendLock(ctx, lockKey, token)
+				if err != nil {
+					continue
+				}
+				if result == extendLockLost {
+					renewal.lost.Store(true)
+					return
+				}
 			}
 		}
 	}()
 
-	return func() {
-		cancel()
-		<-done
-	}
+	return renewal
 }
 
-func (c *Coordinator) extendLock(ctx context.Context, lockKey, token string) error {
+func (c *Coordinator) extendLock(ctx context.Context, lockKey, token string) (extendLockResult, error) {
 	const extendLua = `if redis.call("GET",KEYS[1])==ARGV[1] then return redis.call("PEXPIRE",KEYS[1],ARGV[2]) else return 0 end`
-	return c.client.Eval(ctx, extendLua, []string{lockKey}, token, c.lockTTLMillis()).Err()
+	extended, err := c.client.Eval(ctx, extendLua, []string{lockKey}, token, c.lockTTLMillis()).Int()
+	if err != nil {
+		return extendLockLost, err
+	}
+	if extended == 1 {
+		return extendLockSucceeded, nil
+	}
+	return extendLockLost, nil
 }
 
 func (c *Coordinator) lockTTLMillis() int64 {
