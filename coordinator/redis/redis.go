@@ -101,7 +101,8 @@ func New(client goredis.UniversalClient, opt *Options) *Coordinator {
 // Run implements [dedup.Coordinator].
 //
 // The first caller that acquires SET NX on the lock key becomes the original
-// and executes fn. While fn is running, the original periodically refreshes the
+// and executes fn with a detached context that preserves ctx values but ignores
+// ctx cancellation. While fn is running, the original periodically refreshes the
 // lock lease as long as it still owns the lock. All other concurrent callers
 // subscribe to the done channel and block. When the original finishes it
 // publishes to the done channel and deletes the lock (via a Lua script to
@@ -145,7 +146,7 @@ func (c *Coordinator) Run(
 		if c.onLockAcquired != nil {
 			c.onLockAcquired(key, token)
 		}
-		return fn(ctx)
+		return fn(context.WithoutCancel(ctx))
 	}
 
 	// This instance is a duplicate: subscribe and wait.

@@ -16,7 +16,9 @@ var ErrWaitCompleted = errors.New("dedup: duplicate waited for original")
 //
 // Contract that every implementation must satisfy:
 //
-//   - Exactly one caller of [Run] per key executes fn (the "original").
+//   - Exactly one caller of [Run] per key executes fn (the "original") with a
+//     context that preserves the caller's context values but ignores caller
+//     cancellation.
 //   - All other concurrent callers with the same key (the "duplicates") block
 //     until the original returns.
 //   - On success the coordinator may either return the same [Envelope] value
