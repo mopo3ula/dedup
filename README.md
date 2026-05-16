@@ -41,11 +41,14 @@ import (
 )
 
 func main() {
-    d := dedup.New(
+    d, err := dedup.New(
         memstore.New(),
         sfcoord.New(),
         &dedup.Options{ResultTTL: 30 * time.Second},
     )
+    if err != nil {
+        panic(err)
+    }
 
     _ = d // use in your handlers
 }
@@ -68,11 +71,14 @@ import (
 func main() {
     rdb := goredis.NewClient(&goredis.Options{Addr: "127.0.0.1:6379"})
 
-    d := dedup.New(
+    d, err := dedup.New(
         redistore.New(rdb, "myapp:result:"),
         rediscoord.New(rdb, &rediscoord.Options{Prefix: "myapp"}),
         &dedup.Options{ResultTTL: 30 * time.Second},
     )
+    if err != nil {
+        panic(err)
+    }
 
     _ = d // use in your handlers
 }

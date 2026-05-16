@@ -43,11 +43,14 @@ func main() {
 	// Create a Deduplicator with an in-memory store and singleflight coordinator.
 	// ResultTTL=5s means repeated requests within 5 seconds return the cached
 	// result without invoking the handler again.
-	d := dedup.New(
+	d, err := dedup.New(
 		inmemory.New(),
 		singleflight.New(),
 		&dedup.Options{ResultTTL: 5 * time.Second},
 	)
+	if err != nil {
+		panic(err)
+	}
 
 	ctx := context.Background()
 

@@ -15,30 +15,52 @@ import (
 
 // newTestDeduplicator creates a Deduplicator with in-process implementations.
 func newTestDeduplicator(ttl time.Duration) *dedup.Deduplicator {
-	return dedup.New(memstore.New(), sfcoord.New(), &dedup.Options{ResultTTL: ttl})
+	return dedup.MustNew(memstore.New(), sfcoord.New(), &dedup.Options{ResultTTL: ttl})
 }
 
-func TestNewPanicsOnNilStore(t *testing.T) {
-	assertPanicMessage(t, "dedup: nil ResultStore", func() {
-		dedup.New(nil, sfcoord.New(), nil)
-	})
+func TestNewReturnsErrorOnNilStore(t *testing.T) {
+	d, err := dedup.New(nil, sfcoord.New(), nil)
+	if d != nil {
+		t.Fatalf("deduplicator = %#v, want nil", d)
+	}
+	if !errors.Is(err, dedup.ErrNilResultStore) {
+		t.Fatalf("error = %v, want %v", err, dedup.ErrNilResultStore)
+	}
 }
 
-func TestNewPanicsOnNilCoordinator(t *testing.T) {
-	assertPanicMessage(t, "dedup: nil Coordinator", func() {
-		dedup.New(memstore.New(), nil, nil)
-	})
+func TestNewReturnsErrorOnNilCoordinator(t *testing.T) {
+	d, err := dedup.New(memstore.New(), nil, nil)
+	if d != nil {
+		t.Fatalf("deduplicator = %#v, want nil", d)
+	}
+	if !errors.Is(err, dedup.ErrNilCoordinator) {
+		t.Fatalf("error = %v, want %v", err, dedup.ErrNilCoordinator)
+	}
 }
 
-func TestNewPanicsOnTypedNilDependencies(t *testing.T) {
+func TestNewReturnsErrorOnTypedNilDependencies(t *testing.T) {
 	var store *memstore.Store
-	assertPanicMessage(t, "dedup: nil ResultStore", func() {
-		dedup.New(store, sfcoord.New(), nil)
-	})
+	d, err := dedup.New(store, sfcoord.New(), nil)
+	if d != nil {
+		t.Fatalf("deduplicator = %#v, want nil", d)
+	}
+	if !errors.Is(err, dedup.ErrNilResultStore) {
+		t.Fatalf("error = %v, want %v", err, dedup.ErrNilResultStore)
+	}
 
 	var coordinator *sfcoord.Coordinator
-	assertPanicMessage(t, "dedup: nil Coordinator", func() {
-		dedup.New(memstore.New(), coordinator, nil)
+	d, err = dedup.New(memstore.New(), coordinator, nil)
+	if d != nil {
+		t.Fatalf("deduplicator = %#v, want nil", d)
+	}
+	if !errors.Is(err, dedup.ErrNilCoordinator) {
+		t.Fatalf("error = %v, want %v", err, dedup.ErrNilCoordinator)
+	}
+}
+
+func TestMustNewPanicsOnNilDependency(t *testing.T) {
+	assertPanicError(t, dedup.ErrNilResultStore, func() {
+		dedup.MustNew(nil, sfcoord.New(), nil)
 	})
 }
 
@@ -56,26 +78,25 @@ func TestNilHandlerReturnsMeaningfulError(t *testing.T) {
 		t.Fatal("expected error, got nil")
 	}
 
-	wantErr := errors.New("dedup: nil handler")
-	if !errors.Is(err, wantErr) && err.Error() != wantErr.Error() {
-		t.Fatalf("error = %q, want %q", err.Error(), wantErr.Error())
+	if !errors.Is(err, dedup.ErrNilHandler) {
+		t.Fatalf("error = %v, want %v", err, dedup.ErrNilHandler)
 	}
 }
 
-func assertPanicMessage(t *testing.T, want string, fn func()) {
+func assertPanicError(t *testing.T, want error, fn func()) {
 	t.Helper()
 
 	defer func() {
 		r := recover()
 		if r == nil {
-			t.Fatalf("expected panic %q, got nil", want)
+			t.Fatalf("expected panic %v, got nil", want)
 		}
-		got, ok := r.(string)
+		got, ok := r.(error)
 		if !ok {
-			t.Fatalf("panic = %#v, want string %q", r, want)
+			t.Fatalf("panic = %#v, want error %v", r, want)
 		}
-		if got != want {
-			t.Fatalf("panic = %q, want %q", got, want)
+		if !errors.Is(got, want) {
+			t.Fatalf("panic = %v, want %v", got, want)
 		}
 	}()
 
