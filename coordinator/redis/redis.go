@@ -14,11 +14,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mopo3ula/dedup"
 	goredis "github.com/redis/go-redis/v9"
 )
+
+// ErrLockLost is returned by Run when the original completed fn after it had
+// already lost ownership of its Redis lock. In that state the result is unsafe
+// to publish as the ordinary successful completion for the key.
+var ErrLockLost = errors.New("dedup redis: lock ownership lost")
 
 // Options configures the Redis coordinator.
 type Options struct {
@@ -108,7 +115,9 @@ func New(client goredis.UniversalClient, opt *Options) *Coordinator {
 // prevent accidental deletion by a different owner). If the original failed,
 // waiters return the original error; otherwise they return
 // [dedup.ErrWaitCompleted] so that [dedup.Deduplicator] can fetch the result
-// from [dedup.ResultStore].
+// from [dedup.ResultStore]. If the original loses lock ownership before fn
+// completes, Run returns [ErrLockLost] and publishes that error to waiters
+// instead of advertising an ordinary successful completion.
 func (c *Coordinator) Run(
 	ctx context.Context,
 	key string,
@@ -126,11 +135,21 @@ func (c *Coordinator) Run(
 
 	if acquired {
 		// This instance is the original.
-		stopRenew := c.renewLock(lockKey, token)
+		renewal := c.renewLock(lockKey, token)
 		defer func() {
-			stopRenew()
+			renewal.stop()
 
 			bg := context.Background()
+			if err == nil {
+				if renewal.lost() {
+					env = nil
+					err = ErrLockLost
+				} else if extendErr := c.extendLock(bg, lockKey, token); extendErr != nil {
+					env = nil
+					err = extendErr
+				}
+			}
+
 			if err != nil {
 				_ = c.client.Set(bg, errKey, err.Error(), c.lockTTL).Err()
 			} else {
@@ -201,16 +220,41 @@ func (c *Coordinator) Run(
 	}
 }
 
-func (c *Coordinator) renewLock(lockKey, token string) func() {
+type lockRenewal struct {
+	cancel   context.CancelFunc
+	done     chan struct{}
+	once     sync.Once
+	lostFlag atomic.Bool
+}
+
+func (r *lockRenewal) stop() {
+	r.once.Do(func() {
+		r.cancel()
+		<-r.done
+	})
+}
+
+func (r *lockRenewal) markLost() {
+	r.lostFlag.Store(true)
+}
+
+func (r *lockRenewal) lost() bool {
+	return r.lostFlag.Load()
+}
+
+func (c *Coordinator) renewLock(lockKey, token string) *lockRenewal {
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
+	renewal := &lockRenewal{
+		cancel: cancel,
+		done:   make(chan struct{}),
+	}
 	interval := c.lockTTL / 3
 	if interval <= 0 {
 		interval = c.lockTTL
 	}
 
 	go func() {
-		defer close(done)
+		defer close(renewal.done)
 
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -220,20 +264,28 @@ func (c *Coordinator) renewLock(lockKey, token string) func() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				_ = c.extendLock(ctx, lockKey, token)
+				err := c.extendLock(ctx, lockKey, token)
+				if errors.Is(err, ErrLockLost) {
+					renewal.markLost()
+					return
+				}
 			}
 		}
 	}()
 
-	return func() {
-		cancel()
-		<-done
-	}
+	return renewal
 }
 
 func (c *Coordinator) extendLock(ctx context.Context, lockKey, token string) error {
 	const extendLua = `if redis.call("GET",KEYS[1])==ARGV[1] then return redis.call("PEXPIRE",KEYS[1],ARGV[2]) else return 0 end`
-	return c.client.Eval(ctx, extendLua, []string{lockKey}, token, c.lockTTLMillis()).Err()
+	result, err := c.client.Eval(ctx, extendLua, []string{lockKey}, token, c.lockTTLMillis()).Int64()
+	if err != nil {
+		return err
+	}
+	if result != 1 {
+		return ErrLockLost
+	}
+	return nil
 }
 
 func (c *Coordinator) lockTTLMillis() int64 {
@@ -260,6 +312,9 @@ func (c *Coordinator) originalFinished(ctx context.Context, lockKey string) (boo
 func (c *Coordinator) completed(ctx context.Context, errKey string) (*dedup.Envelope, error) {
 	originalErr, err := c.client.Get(ctx, errKey).Result()
 	if err == nil {
+		if originalErr == ErrLockLost.Error() {
+			return nil, ErrLockLost
+		}
 		return nil, errors.New(originalErr)
 	}
 	if errors.Is(err, goredis.Nil) {
