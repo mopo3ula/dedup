@@ -18,6 +18,70 @@ func newTestDeduplicator(ttl time.Duration) *dedup.Deduplicator {
 	return dedup.New(memstore.New(), sfcoord.New(), &dedup.Options{ResultTTL: ttl})
 }
 
+func TestNewPanicsOnNilStore(t *testing.T) {
+	assertPanicMessage(t, "dedup: nil ResultStore", func() {
+		dedup.New(nil, sfcoord.New(), nil)
+	})
+}
+
+func TestNewPanicsOnNilCoordinator(t *testing.T) {
+	assertPanicMessage(t, "dedup: nil Coordinator", func() {
+		dedup.New(memstore.New(), nil, nil)
+	})
+}
+
+func TestNewPanicsOnTypedNilDependencies(t *testing.T) {
+	var store *memstore.Store
+	assertPanicMessage(t, "dedup: nil ResultStore", func() {
+		dedup.New(store, sfcoord.New(), nil)
+	})
+
+	var coordinator *sfcoord.Coordinator
+	assertPanicMessage(t, "dedup: nil Coordinator", func() {
+		dedup.New(memstore.New(), coordinator, nil)
+	})
+}
+
+func TestNilHandlerReturnsMeaningfulError(t *testing.T) {
+	d := newTestDeduplicator(time.Second)
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Do panicked: %v", r)
+		}
+	}()
+
+	_, err := d.Do(context.Background(), "nil-handler", nil)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	wantErr := errors.New("dedup: nil handler")
+	if !errors.Is(err, wantErr) && err.Error() != wantErr.Error() {
+		t.Fatalf("error = %q, want %q", err.Error(), wantErr.Error())
+	}
+}
+
+func assertPanicMessage(t *testing.T, want string, fn func()) {
+	t.Helper()
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatalf("expected panic %q, got nil", want)
+		}
+		got, ok := r.(string)
+		if !ok {
+			t.Fatalf("panic = %#v, want string %q", r, want)
+		}
+		if got != want {
+			t.Fatalf("panic = %q, want %q", got, want)
+		}
+	}()
+
+	fn()
+}
+
 // TestDeduplicatesConcurrentCalls verifies that when N goroutines call Do with
 // the same key simultaneously, the handler is executed exactly once and every
 // caller receives the same result.

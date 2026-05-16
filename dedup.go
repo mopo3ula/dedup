@@ -3,6 +3,7 @@ package dedup
 import (
 	"context"
 	"errors"
+	"reflect"
 	"time"
 )
 
@@ -88,6 +89,7 @@ type Deduplicator struct {
 
 // New creates a [Deduplicator] backed by the provided [ResultStore] and
 // [Coordinator]. opt may be nil; defaults are used in that case.
+// It panics if store or coordinator is nil.
 //
 // Typical combinations:
 //
@@ -97,6 +99,13 @@ type Deduplicator struct {
 //	// Multi-instance deployment (Redis required)
 //	dedup.New(redistore.New(rdb, "prefix:"), rediscoord.New(rdb, nil), nil)
 func New(store ResultStore, coordinator Coordinator, opt *Options) *Deduplicator {
+	if isNilDependency(store) {
+		panic("dedup: nil ResultStore")
+	}
+	if isNilDependency(coordinator) {
+		panic("dedup: nil Coordinator")
+	}
+
 	return &Deduplicator{
 		store:       store,
 		coordinator: coordinator,
@@ -105,6 +114,7 @@ func New(store ResultStore, coordinator Coordinator, opt *Options) *Deduplicator
 }
 
 // Do executes fn at most once per key within the [Options.ResultTTL] window.
+// It returns an error if key is empty or fn is nil.
 //
 // Behaviour:
 //   - If a result for key is already cached in [ResultStore], it is returned
@@ -124,6 +134,9 @@ func (d *Deduplicator) Do(
 	key string,
 	fn func(context.Context) (*Envelope, error),
 ) (*Envelope, error) {
+	if fn == nil {
+		return nil, errors.New("dedup: nil handler")
+	}
 	if key == "" {
 		return nil, errors.New("dedup: key is empty")
 	}
@@ -212,4 +225,18 @@ func (d *Deduplicator) Do(
 		d.opt.OnEvent(Event{Kind: EventDuplicate, Key: key})
 	}
 	return cached.clone(), nil
+}
+
+func isNilDependency(v any) bool {
+	if v == nil {
+		return true
+	}
+
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return rv.IsNil()
+	default:
+		return false
+	}
 }
