@@ -2,7 +2,7 @@
 //
 // Results are JSON-serialised and stored with the given TTL. Use this store
 // together with [coordinator/redis] so that all service instances share the
-// same completed-result cache.
+// same completed-result hand-off.
 package redis
 
 import (
