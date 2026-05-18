@@ -17,5 +17,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - `store/inmemory` – in-process map with TTL eviction.
     - `store/redis` – Redis-backed, JSON-serialised results.
 - `key` package with `FromParts`, `FromJSON`, `FromMap` helpers.
-- Full test suite including concurrency, sequential-call, TTL hand-off, and benchmark tests.
+- Full test suite including concurrency, cache-hit, TTL-expiry, and benchmark tests.
 

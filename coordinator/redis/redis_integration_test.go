@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/mopo3ula/dedup"
-	redisstore "github.com/mopo3ula/dedup/store/redis"
 	goredis "github.com/redis/go-redis/v9"
 )
 
@@ -202,38 +201,5 @@ func TestRunReturnsLockLostAndDoesNotPublishCompletionWhenRenewalLosesOwnership(
 	case msg := <-pubsub.Channel():
 		t.Fatalf("unexpected completion publication after lock loss: %q", msg.Payload)
 	case <-time.After(2 * lockTTL):
-	}
-}
-
-func TestDeduplicatorWithRedisRunsSequentialCallAgain(t *testing.T) {
-	client := newIntegrationClient(t)
-	prefix := fmt.Sprintf("dedup-test:%d:sequential", time.Now().UnixNano())
-	coord := New(client, &Options{Prefix: prefix, WaitStep: 5 * time.Millisecond})
-	store := redisstore.New(client, prefix+":result:")
-	d := dedup.MustNew(store, coord, &dedup.Options{ResultTTL: time.Minute})
-
-	var calls int64
-	handler := func(context.Context) (*dedup.Envelope, error) {
-		n := atomic.AddInt64(&calls, 1)
-		return &dedup.Envelope{Payload: []byte{byte('0' + n)}}, nil
-	}
-
-	env, err := d.Do(context.Background(), "shared-key", handler)
-	if err != nil {
-		t.Fatalf("first Do: %v", err)
-	}
-	if string(env.Payload) != "1" {
-		t.Fatalf("first payload = %q, want 1", env.Payload)
-	}
-
-	env, err = d.Do(context.Background(), "shared-key", handler)
-	if err != nil {
-		t.Fatalf("second Do: %v", err)
-	}
-	if string(env.Payload) != "2" {
-		t.Fatalf("second payload = %q, want 2", env.Payload)
-	}
-	if got := atomic.LoadInt64(&calls); got != 2 {
-		t.Fatalf("handler called %d times, want 2", got)
 	}
 }

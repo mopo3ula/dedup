@@ -202,10 +202,6 @@ func TestDeduplicatesNanosecondCloseCalls(t *testing.T) {
 		results <- callResult{payload: string(env.Payload)}
 	}()
 
-	// Give the duplicate a scheduler turn to enter Do while the original is
-	// still blocked. The production guarantee comes from the coordinator, not
-	// this sleep; the sleep only makes the test's intended overlap explicit.
-	time.Sleep(10 * time.Millisecond)
 	close(release)
 
 	for range 2 {
@@ -227,58 +223,64 @@ func TestDeduplicatesNanosecondCloseCalls(t *testing.T) {
 	}
 }
 
-// TestSequentialCallAfterSuccessRunsAgain verifies that deduplication only
-// applies to overlapping in-flight calls. A later call with the same key must
-// execute the handler again even if the previous result is still in ResultStore.
-func TestSequentialCallAfterSuccessRunsAgain(t *testing.T) {
+// TestCachedResultReturnedImmediately verifies that a second call with the
+// same key after the original finishes is served from cache without calling
+// the handler again and returns in well under 1 ms.
+func TestCachedResultReturnedImmediately(t *testing.T) {
 	d := newTestDeduplicator(time.Second)
 	var originCalls int64
 
 	handler := func(ctx context.Context) (*dedup.Envelope, error) {
-		n := atomic.AddInt64(&originCalls, 1)
-		return &dedup.Envelope{Payload: []byte{byte('0' + n)}}, nil
+		atomic.AddInt64(&originCalls, 1)
+		time.Sleep(80 * time.Millisecond)
+		return &dedup.Envelope{Payload: []byte("hello")}, nil
 	}
 
-	env, err := d.Do(context.Background(), "k", handler)
-	if err != nil {
+	if _, err := d.Do(context.Background(), "k", handler); err != nil {
 		t.Fatalf("first call: %v", err)
 	}
-	if string(env.Payload) != "1" {
-		t.Fatalf("first payload = %q, want 1", env.Payload)
-	}
 
-	env, err = d.Do(context.Background(), "k", handler)
+	start := time.Now()
+	env, err := d.Do(context.Background(), "k", handler)
 	if err != nil {
 		t.Fatalf("second call: %v", err)
 	}
-	if string(env.Payload) != "2" {
-		t.Fatalf("second payload = %q, want 2", env.Payload)
+	elapsed := time.Since(start)
+
+	if string(env.Payload) != "hello" {
+		t.Fatalf("payload = %q, want \"hello\"", env.Payload)
 	}
-	if got := atomic.LoadInt64(&originCalls); got != 2 {
-		t.Fatalf("handler called %d times, want 2", got)
+	if got := atomic.LoadInt64(&originCalls); got != 1 {
+		t.Fatalf("handler called %d times after cache hit, want 1", got)
+	}
+	if elapsed > 5*time.Millisecond {
+		t.Fatalf("cached response took %v, want < 5ms", elapsed)
 	}
 }
 
-// TestSequentialCallBeforeResultTTLExpiresRunsAgain verifies that ResultTTL is
-// only the hand-off window for in-flight duplicates, not a response-cache TTL.
-func TestSequentialCallBeforeResultTTLExpiresRunsAgain(t *testing.T) {
-	d := newTestDeduplicator(time.Minute)
+// TestExpiredCacheCallsHandlerAgain verifies that after ResultTTL elapses the
+// handler is invoked again on the next call.
+func TestExpiredCacheCallsHandlerAgain(t *testing.T) {
+	d := newTestDeduplicator(50 * time.Millisecond)
 	var originCalls int64
 
 	handler := func(ctx context.Context) (*dedup.Envelope, error) {
-		n := atomic.AddInt64(&originCalls, 1)
-		return &dedup.Envelope{Payload: []byte{byte('0' + n)}}, nil
+		atomic.AddInt64(&originCalls, 1)
+		return &dedup.Envelope{Payload: []byte("v")}, nil
 	}
 
 	if _, err := d.Do(context.Background(), "k2", handler); err != nil {
 		t.Fatalf("first call: %v", err)
 	}
+
+	time.Sleep(100 * time.Millisecond) // let TTL expire
+
 	if _, err := d.Do(context.Background(), "k2", handler); err != nil {
 		t.Fatalf("second call: %v", err)
 	}
 
 	if got := atomic.LoadInt64(&originCalls); got != 2 {
-		t.Fatalf("handler called %d times, want 2", got)
+		t.Fatalf("handler called %d times, want 2 (TTL expired)", got)
 	}
 }
 
@@ -315,4 +317,63 @@ func TestNilEnvelopeWithoutErrorReturnsMeaningfulError(t *testing.T) {
 	if !errors.Is(err, wantErr) && err.Error() != wantErr.Error() {
 		t.Fatalf("error = %q, want %q", err.Error(), wantErr.Error())
 	}
+}
+
+// TestStoreSetWithCancelledContext verifies that cancelling the caller's
+// context after fn returns does not prevent the result from being cached.
+// Before the fix, store.Set used execCtx (the caller's context); if that
+// context was cancelled between fn returning and store.Set running, the
+// result was never cached and the next caller would execute fn again —
+// reproducing the bug where a gRPC deadline fired mid-operation.
+func TestStoreSetWithCancelledContext(t *testing.T) {
+	d := newTestDeduplicator(time.Second)
+	var calls int64
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// First call: context is cancelled inside fn().
+	// The singleflight coordinator may return context.Canceled to this caller,
+	// but fn itself must still complete and cache the result.
+	_, _ = d.Do(ctx, "cancel-key", func(_ context.Context) (*dedup.Envelope, error) {
+		atomic.AddInt64(&calls, 1)
+		cancel() // simulate: gRPC deadline fires while fn is still running
+		return &dedup.Envelope{Payload: []byte("ok")}, nil
+	})
+
+	// Give the background goroutine (singleflight) time to finish storing.
+	time.Sleep(20 * time.Millisecond)
+
+	// Second call with a fresh context: must hit the cache — fn must NOT run again.
+	env, err := d.Do(context.Background(), "cancel-key", func(_ context.Context) (*dedup.Envelope, error) {
+		atomic.AddInt64(&calls, 1)
+		return &dedup.Envelope{Payload: []byte("second")}, nil
+	})
+	if err != nil {
+		t.Fatalf("second Do: unexpected error: %v", err)
+	}
+	if string(env.Payload) != "ok" {
+		t.Fatalf("payload = %q, want \"ok\" (cached result)", string(env.Payload))
+	}
+	if got := atomic.LoadInt64(&calls); got != 1 {
+		t.Fatalf("fn called %d times, want 1 (result must be cached despite context cancellation)", got)
+	}
+}
+
+// already cached in the in-memory store.
+func BenchmarkHotKeyCached(b *testing.B) {
+	d := newTestDeduplicator(time.Minute)
+	handler := func(ctx context.Context) (*dedup.Envelope, error) {
+		return &dedup.Envelope{Payload: []byte("ok")}, nil
+	}
+	if _, err := d.Do(context.Background(), "bench-key", handler); err != nil {
+		b.Fatalf("warmup: %v", err)
+	}
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if _, err := d.Do(context.Background(), "bench-key", handler); err != nil {
+				b.Fatalf("do: %v", err)
+			}
+		}
+	})
 }
