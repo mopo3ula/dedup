@@ -5,9 +5,9 @@
 // When multiple identical requests with the same deduplication key arrive
 // concurrently, one caller becomes the "original" and executes the handler.
 // Duplicates block until the original finishes and receive the same [Envelope].
-// Later requests that start after the original has completed execute the
-// handler again; [ResultStore] is only a short-lived hand-off for waiters that
-// were already in-flight.
+// Later requests execute the handler again after the coordinator's in-flight
+// window has closed; [ResultStore] is only a short-lived hand-off for duplicate
+// waiters, not a long-lived response cache.
 //
 // # Guarantees and limits
 //
@@ -18,9 +18,14 @@
 // the same Redis coordinator namespace and result-store namespace.
 //
 // For the Redis coordinator, [coordinator/redis.Options.LockTTL] is a renewable
-// Redis lease, not a hard limit on handler runtime. It must be long enough to
-// survive short Redis hiccups and scheduler pauses between renewals. If the
-// process crashes or the lease cannot be renewed until it expires, another
+// Redis lease, not a hard limit on handler runtime.
+// [coordinator/redis.Options.CompletionTTL] is a short post-completion grace
+// period that suppresses second originals from the same near-simultaneous
+// request burst after very fast handlers. Keep [Options.ResultTTL] longer than
+// the Redis completion TTL so those burst duplicates can read the hand-off
+// result. LockTTL must be long enough to survive short Redis hiccups and
+// scheduler pauses between renewals. If the process crashes or the lease cannot
+// be renewed until it expires, another
 // caller can acquire the lock and execute the handler again. The package
 // deduplicates request handling; it does not by itself provide end-to-end
 // exactly-once side effects across process crashes, Redis outages, or

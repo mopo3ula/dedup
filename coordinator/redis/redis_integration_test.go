@@ -205,10 +205,11 @@ func TestRunReturnsLockLostAndDoesNotPublishCompletionWhenRenewalLosesOwnership(
 	}
 }
 
-func TestDeduplicatorWithRedisRunsSequentialCallAgain(t *testing.T) {
+func TestDeduplicatorWithRedisRunsSequentialCallAgainAfterCompletionTTL(t *testing.T) {
 	client := newIntegrationClient(t)
 	prefix := fmt.Sprintf("dedup-test:%d:sequential", time.Now().UnixNano())
-	coord := New(client, &Options{Prefix: prefix, WaitStep: 5 * time.Millisecond})
+	completionTTL := 10 * time.Millisecond
+	coord := New(client, &Options{Prefix: prefix, WaitStep: 5 * time.Millisecond, CompletionTTL: completionTTL})
 	store := redisstore.New(client, prefix+":result:")
 	d := dedup.MustNew(store, coord, &dedup.Options{ResultTTL: time.Minute})
 
@@ -226,6 +227,8 @@ func TestDeduplicatorWithRedisRunsSequentialCallAgain(t *testing.T) {
 		t.Fatalf("first payload = %q, want 1", env.Payload)
 	}
 
+	time.Sleep(2 * completionTTL)
+
 	env, err = d.Do(context.Background(), "shared-key", handler)
 	if err != nil {
 		t.Fatalf("second Do: %v", err)
@@ -235,5 +238,57 @@ func TestDeduplicatorWithRedisRunsSequentialCallAgain(t *testing.T) {
 	}
 	if got := atomic.LoadInt64(&calls); got != 2 {
 		t.Fatalf("handler called %d times, want 2", got)
+	}
+}
+
+func TestDeduplicatorWithRedisSuppressesFastBurstAfterOriginalCompletes(t *testing.T) {
+	client := newIntegrationClient(t)
+	prefix := fmt.Sprintf("dedup-test:%d:fast-burst", time.Now().UnixNano())
+	coord := New(client, &Options{
+		Prefix:        prefix,
+		WaitStep:      time.Millisecond,
+		CompletionTTL: 100 * time.Millisecond,
+	})
+	store := redisstore.New(client, prefix+":result:")
+	d := dedup.MustNew(store, coord, &dedup.Options{ResultTTL: time.Minute})
+
+	const callers = 5
+	var calls int64
+	start := make(chan struct{})
+	done := make(chan error, callers)
+
+	for range callers {
+		go func() {
+			<-start
+			env, err := d.Do(context.Background(), "shared-key", func(context.Context) (*dedup.Envelope, error) {
+				n := atomic.AddInt64(&calls, 1)
+				return &dedup.Envelope{Payload: []byte{byte('0' + n)}}, nil
+			})
+			if err != nil {
+				done <- err
+				return
+			}
+			if string(env.Payload) != "1" {
+				done <- fmt.Errorf("payload = %q, want 1", env.Payload)
+				return
+			}
+			done <- nil
+		}()
+	}
+
+	close(start)
+	for range callers {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for burst callers")
+		}
+	}
+
+	if got := atomic.LoadInt64(&calls); got != 1 {
+		t.Fatalf("handler called %d times, want exactly 1", got)
 	}
 }

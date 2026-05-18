@@ -50,6 +50,13 @@ type Options struct {
 	// OnLockMissed, if non-nil, is called when SET NX fails — this caller is a
 	// duplicate and will wait for the original to finish.
 	OnLockMissed func(key, coordinatorID string)
+
+	// CompletionTTL controls how long a just-completed key remains closed to new
+	// originals after fn returns. This short grace period covers request bursts
+	// where several callers start at nearly the same time but some reach Redis
+	// just after a very fast original has already released its active lock.
+	// Default: 100ms.
+	CompletionTTL time.Duration
 }
 
 // ErrLockLost is returned by [Coordinator.Run] when the original executor
@@ -58,12 +65,15 @@ type Options struct {
 // have acquired the same key and started a newer generation of work.
 var ErrLockLost = errors.New("dedup redis: lock ownership lost")
 
+const completedMarker = "__dedup_completed__"
+
 // Coordinator is a distributed [dedup.Coordinator] that uses Redis SET NX +
 // Pub/Sub to coordinate across multiple service instances.
 type Coordinator struct {
 	client         goredis.UniversalClient
 	lockTTL        time.Duration
 	waitStep       time.Duration
+	completionTTL  time.Duration
 	keyPrefix      string
 	chanPrefix     string
 	errPrefix      string
@@ -75,9 +85,10 @@ type Coordinator struct {
 // opt may be nil; defaults are used in that case.
 func New(client goredis.UniversalClient, opt *Options) *Coordinator {
 	cfg := Options{
-		LockTTL:  5 * time.Second,
-		WaitStep: 20 * time.Millisecond,
-		Prefix:   "dedup",
+		LockTTL:       5 * time.Second,
+		WaitStep:      20 * time.Millisecond,
+		Prefix:        "dedup",
+		CompletionTTL: 100 * time.Millisecond,
 	}
 	var onAcquired, onMissed func(key, coordinatorID string)
 	if opt != nil {
@@ -90,6 +101,9 @@ func New(client goredis.UniversalClient, opt *Options) *Coordinator {
 		if opt.Prefix != "" {
 			cfg.Prefix = opt.Prefix
 		}
+		if opt.CompletionTTL > 0 {
+			cfg.CompletionTTL = opt.CompletionTTL
+		}
 		onAcquired = opt.OnLockAcquired
 		onMissed = opt.OnLockMissed
 	}
@@ -97,6 +111,7 @@ func New(client goredis.UniversalClient, opt *Options) *Coordinator {
 		client:         client,
 		lockTTL:        cfg.LockTTL,
 		waitStep:       cfg.WaitStep,
+		completionTTL:  cfg.CompletionTTL,
 		keyPrefix:      fmt.Sprintf("%s:lock:", cfg.Prefix),
 		chanPrefix:     fmt.Sprintf("%s:done:", cfg.Prefix),
 		errPrefix:      fmt.Sprintf("%s:error:", cfg.Prefix),
@@ -112,8 +127,10 @@ func New(client goredis.UniversalClient, opt *Options) *Coordinator {
 // ctx cancellation. While fn is running, the original periodically refreshes the
 // lock lease as long as it still owns the lock. All other concurrent callers
 // subscribe to the done channel and block. When the original finishes it
-// publishes to the done channel and deletes the lock (via a Lua script to
-// prevent accidental deletion by a different owner). If lock renewal detects
+// atomically replaces the active lock with a short completed marker before
+// publishing to the done channel. That marker keeps near-simultaneous burst
+// callers from starting a second original immediately after a very fast first
+// original finishes. If lock renewal detects
 // that another owner has replaced or removed the lock before fn returns, Run
 // returns [ErrLockLost] and does not publish a normal completion signal. If
 // the original failed, waiters return the original error; otherwise they return
@@ -129,12 +146,15 @@ func (c *Coordinator) Run(
 	errKey := c.errPrefix + key
 	token := fmt.Sprintf("%p:%d", c, time.Now().UnixNano())
 
-	acquired, err := c.client.SetNX(ctx, lockKey, token, c.lockTTL).Result()
+	state, err := c.acquire(ctx, lockKey, token)
 	if err != nil {
 		return nil, err
 	}
+	if state == acquireRecentlyCompleted {
+		return c.completed(ctx, errKey)
+	}
 
-	if acquired {
+	if state == acquireLockAcquired {
 		// This instance is the original.
 		renewal := c.renewLock(lockKey, token)
 		defer func() {
@@ -146,15 +166,19 @@ func (c *Coordinator) Run(
 
 			bg := context.Background()
 			if err != nil {
-				_ = c.client.Set(bg, errKey, err.Error(), c.lockTTL).Err()
+				_ = c.client.Set(bg, errKey, err.Error(), c.completionTTL).Err()
 			} else {
 				_ = c.client.Del(bg, errKey).Err()
 			}
-			// Notify all waiters before releasing the lock, so the next
-			// generation of callers cannot consume this completion signal.
+			completed, completeErr := c.markCompleted(bg, lockKey, token)
+			if completeErr != nil || !completed {
+				err = ErrLockLost
+				return
+			}
+			// Notify all waiters after atomically replacing the active lock with a
+			// short completed marker. New burst callers cannot start another
+			// original until that marker expires.
 			_ = c.client.Publish(bg, doneCh, "done").Err()
-			// Release lock only if we still own it (Lua CAS).
-			_ = c.releaseLock(bg, lockKey, token)
 		}()
 		if c.onLockAcquired != nil {
 			c.onLockAcquired(key, token)
@@ -177,7 +201,7 @@ func (c *Coordinator) Run(
 
 	// The original may finish in the tiny window between our failed SET NX
 	// attempt and the moment the subscription becomes active. Pub/Sub would not
-	// replay that already-published message, so check the lock immediately after
+	// replay that already-published message, so check the state immediately after
 	// subscribing before falling back to ticker-based polling. This keeps
 	// nanosecond-close duplicate arrivals from waiting for WaitStep just because
 	// they missed the notification.
@@ -203,8 +227,9 @@ func (c *Coordinator) Run(
 			return c.completed(ctx, errKey)
 
 		case <-ticker.C:
-			// Fallback poll: if the lock is gone the original has finished
-			// (lock TTL expired or it was released normally).
+			// Fallback poll: if the key is gone or marked completed, the
+			// original has finished (lock TTL expired, process crashed, or the
+			// normal completion marker was written).
 			finished, existsErr := c.originalFinished(ctx, lockKey)
 			if existsErr != nil {
 				return nil, existsErr
@@ -292,17 +317,49 @@ func (c *Coordinator) lockTTLMillis() int64 {
 	return millis
 }
 
-func (c *Coordinator) releaseLock(ctx context.Context, lockKey, token string) error {
-	const releaseLua = `if redis.call("GET",KEYS[1])==ARGV[1] then return redis.call("DEL",KEYS[1]) else return 0 end`
-	return c.client.Eval(ctx, releaseLua, []string{lockKey}, token).Err()
+type acquireResult int
+
+const (
+	acquireLockMissed acquireResult = iota
+	acquireLockAcquired
+	acquireRecentlyCompleted
+)
+
+func (c *Coordinator) acquire(ctx context.Context, lockKey, token string) (acquireResult, error) {
+	const acquireLua = `local v=redis.call("GET",KEYS[1]); if v==ARGV[3] then return 2 end; if not v then redis.call("SET",KEYS[1],ARGV[1],"PX",ARGV[2]); return 1 end; return 0`
+	result, err := c.client.Eval(ctx, acquireLua, []string{lockKey}, token, c.lockTTLMillis(), completedMarker).Int()
+	if err != nil {
+		return acquireLockMissed, err
+	}
+	return acquireResult(result), nil
 }
 
-func (c *Coordinator) originalFinished(ctx context.Context, lockKey string) (bool, error) {
-	exists, err := c.client.Exists(ctx, lockKey).Result()
+func (c *Coordinator) markCompleted(ctx context.Context, lockKey, token string) (bool, error) {
+	const completeLua = `if redis.call("GET",KEYS[1])==ARGV[1] then redis.call("SET",KEYS[1],ARGV[3],"PX",ARGV[2]); return 1 else return 0 end`
+	result, err := c.client.Eval(ctx, completeLua, []string{lockKey}, token, c.completionTTLMillis(), completedMarker).Int()
 	if err != nil {
 		return false, err
 	}
-	return exists == 0, nil
+	return result == 1, nil
+}
+
+func (c *Coordinator) completionTTLMillis() int64 {
+	millis := c.completionTTL.Milliseconds()
+	if millis <= 0 {
+		return 1
+	}
+	return millis
+}
+
+func (c *Coordinator) originalFinished(ctx context.Context, lockKey string) (bool, error) {
+	v, err := c.client.Get(ctx, lockKey).Result()
+	if err == nil {
+		return v == completedMarker, nil
+	}
+	if errors.Is(err, goredis.Nil) {
+		return true, nil
+	}
+	return false, err
 }
 
 func (c *Coordinator) completed(ctx context.Context, errKey string) (*dedup.Envelope, error) {
