@@ -11,15 +11,17 @@ import (
 type EventKind string
 
 const (
-	// EventCacheHit is fired when the fast-path cache lookup returns a result.
+	// EventCacheHit is kept for backward compatibility.
+	// Deprecated: completed results are no longer used as a response cache.
 	EventCacheHit EventKind = "cache_hit"
-	// EventCacheMiss is fired when the fast-path cache lookup finds nothing.
+	// EventCacheMiss is kept for backward compatibility.
+	// Deprecated: completed results are no longer used as a response cache.
 	EventCacheMiss EventKind = "cache_miss"
 	// EventOriginal is fired when this caller becomes the original executor.
 	// fn will be called next.
 	EventOriginal EventKind = "original"
-	// EventInnerCacheHit is fired when the inner (post-lock) cache check
-	// finds a previously stored result, so fn is skipped.
+	// EventInnerCacheHit is kept for backward compatibility.
+	// Deprecated: completed results are no longer used as a response cache.
 	EventInnerCacheHit EventKind = "inner_cache_hit"
 	// EventDuplicate is fired when this caller was a duplicate waiter and the
 	// original has now completed.
@@ -28,7 +30,7 @@ const (
 
 // Event carries information about a single internal decision made by
 // [Deduplicator.Do]. Attach a handler via [Options.OnEvent] to observe
-// cache hits, coordinator decisions, and fn invocations.
+// coordinator decisions and fn invocations.
 type Event struct {
 	Kind EventKind
 	Key  string
@@ -40,9 +42,9 @@ type Event struct {
 
 // Options configures [Deduplicator] behaviour.
 type Options struct {
-	// ResultTTL controls how long a completed result is kept in [ResultStore].
-	// Requests arriving within this window after the original finishes are
-	// served from cache without re-executing the handler.
+	// ResultTTL controls how long a completed result is kept in [ResultStore]
+	// for duplicate waiters that were already in-flight. Later calls that did
+	// not overlap with the original do not use this stored result as a cache.
 	// Default: 30s.
 	ResultTTL time.Duration
 
@@ -51,8 +53,8 @@ type Options struct {
 	Now func() time.Time
 
 	// OnEvent, if non-nil, is called synchronously for every notable internal
-	// decision: cache hits/misses, coordinator role (original vs duplicate),
-	// and inner-cache hits that skip fn. Useful for metrics and debugging.
+	// decision: coordinator role (original vs duplicate) and fn invocations.
+	// Useful for metrics and debugging.
 	// The callback must not block for long; it runs in the caller's goroutine.
 	OnEvent func(e Event)
 }
@@ -133,23 +135,25 @@ func MustNew(store ResultStore, coordinator Coordinator, opt *Options) *Deduplic
 	return d
 }
 
-// Do executes fn at most once per key within the [Options.ResultTTL] window.
+// Do executes fn at most once for simultaneous calls with the same key.
 // It returns an error if key is empty or fn is nil.
 //
 // Behaviour:
-//   - If a result for key is already cached in [ResultStore], it is returned
-//     immediately without calling fn.
 //   - If an identical key is currently in-flight, Do blocks until the original
 //     finishes and then returns the same [Envelope].
-//   - Otherwise fn is executed as the "original", its result is stored in
-//     [ResultStore], and returned.
+//   - If no identical key is currently in-flight, fn is executed as the
+//     "original" even when an earlier call with the same key has already
+//     completed.
+//   - [ResultStore] is used only as a short-lived hand-off for in-flight
+//     duplicate waiters; completed results are not treated as a response cache
+//     for later, non-overlapping calls.
 //
 // fn receives a context derived from ctx that preserves ctx values while
 // ignoring ctx cancellation. Cancelling ctx interrupts duplicate waiters but
 // does not abort an already-running original.
 //
 // The returned [Envelope] is always a fresh deep copy; callers may mutate it
-// freely without affecting cached data.
+// freely without affecting stored hand-off data.
 func (d *Deduplicator) Do(
 	ctx context.Context,
 	key string,
@@ -162,26 +166,6 @@ func (d *Deduplicator) Do(
 		return nil, errors.New("dedup: key is empty")
 	}
 
-	// Fast path: result already in store.
-	if cached, err := d.store.Get(ctx, key); err == nil {
-		if d.opt.OnEvent != nil {
-			d.opt.OnEvent(Event{
-				Kind: EventCacheHit,
-				Key:  key,
-			})
-		}
-		return cached.clone(), nil
-	} else if !errors.Is(err, ErrNotFound) {
-		return nil, err
-	}
-
-	if d.opt.OnEvent != nil {
-		d.opt.OnEvent(Event{
-			Kind: EventCacheMiss,
-			Key:  key,
-		})
-	}
-
 	result, err := d.coordinator.Run(ctx, key, func(execCtx context.Context) (*Envelope, error) {
 		// Store operations use a detached context so that a cancelled or
 		// expired caller context (e.g. gRPC deadline) does not prevent the
@@ -189,20 +173,6 @@ func (d *Deduplicator) Do(
 		// release the coordinator lock without caching the result, allowing
 		// the next caller to become the new original and execute fn again.
 		storeCtx := context.WithoutCancel(execCtx)
-
-		// Another goroutine may have stored the result while we were acquiring
-		// the coordinator lock; avoid redundant fn calls.
-		if cached, cacheErr := d.store.Get(storeCtx, key); cacheErr == nil {
-			if d.opt.OnEvent != nil {
-				d.opt.OnEvent(Event{
-					Kind: EventInnerCacheHit,
-					Key:  key,
-				})
-			}
-			return cached.clone(), nil
-		} else if !errors.Is(cacheErr, ErrNotFound) {
-			return nil, cacheErr
-		}
 
 		if d.opt.OnEvent != nil {
 			d.opt.OnEvent(Event{

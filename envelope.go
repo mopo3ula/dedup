@@ -20,7 +20,7 @@ type Envelope struct {
 	CreatedAt time.Time
 }
 
-// clone returns a deep copy so that callers cannot mutate the cached value.
+// clone returns a deep copy so that callers cannot mutate stored hand-off values.
 func (e *Envelope) clone() *Envelope {
 	if e == nil {
 		return nil

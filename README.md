@@ -4,8 +4,8 @@ Transparent request deduplication for Go services.
 When multiple identical requests with the same deduplication key arrive
 concurrently, only one request becomes the **original** and executes the
 handler. All duplicates block and receive **the same result** the moment the
-original finishes. Subsequent requests within the TTL window are answered
-**instantly from cache** — the handler is not called again.
+original finishes. Later requests that start after the original has completed
+execute the handler again; completed results are not used as a response cache.
 
 ## Features
 
@@ -17,7 +17,7 @@ original finishes. Subsequent requests within the TTL window are answered
     - `store/inmemory` — in-process, zero external dependencies.
     - `store/redis` — shared across all instances.
 - **Extensible** — implement `Coordinator` or `ResultStore` to plug in any backend.
-- **Safe** — deep-copies are returned to callers; cached data is never mutated.
+- **Safe** — deep-copies are returned to callers; stored hand-off data is never mutated.
 
 ## Installation
 
@@ -104,7 +104,7 @@ func handle(ctx context.Context, d *dedup.Deduplicator, userID, action string, r
     k := key.FromParts(userID, action, string(requestBody))
 
     env, err := d.Do(ctx, k, func(ctx context.Context) (*dedup.Envelope, error) {
-        // This function is called at most once per key per ResultTTL window.
+        // This function is called at most once per key while a call is in-flight.
         result, err := callExpensiveUpstream(ctx)
         if err != nil {
             return nil, err
@@ -150,14 +150,18 @@ github.com/mopo3ula/dedup
 ```
 Request A ──► Do(ctx, key, fn) ──► Coordinator.Run ──► fn() executes ──► ResultStore.Set ──► respond
 Request B ──► Do(ctx, key, fn) ──► Coordinator.Run ──► blocks ──────────────────────────► respond (same Envelope)
-Request C ──► Do(ctx, key, fn) ──► ResultStore.Get ─────────────────────────────────── respond instantly (cached)
+Request C ──► Do(ctx, key, fn) ──► Coordinator.Run ──► fn() executes again ─────────────► respond (new Envelope)
 ```
 
 1. **A** acquires the coordinator lock and runs `fn`.
 2. **B** arrives while **A** is running — blocks in the coordinator.
 3. **A** finishes → stores result in `ResultStore` → releases lock → notifies **B**.
 4. **B** wakes up, reads result from `ResultStore`, returns the same `Envelope`.
-5. **C** arrives after **A** finishes → `ResultStore.Get` returns immediately (within TTL).
+5. **C** arrives after **A** finishes → it does not overlap with **A**, so it becomes a new original and runs `fn` again.
+
+`ResultStore` is only a short-lived hand-off channel for waiters that were
+already in-flight while the original was running. `ResultTTL` controls how long
+that hand-off remains readable; it is not a response-cache window.
 
 Correctness does not rely on artificial sleeps or millisecond-sized gaps between
 requests: callers that arrive nanoseconds apart are coordinated by the
@@ -176,8 +180,8 @@ For a given deduplication key, `dedup` coalesces concurrent calls as follows:
 - **Multiple instances:** `coordinator/redis` uses Redis `SET NX` as a shared
   distributed lock, so all instances that use the same Redis client namespace
   compete for one original caller.
-- **After success:** the original stores the completed `Envelope` in
-  `ResultStore`, and calls arriving within `ResultTTL` are served from cache.
+- **After success:** a later call that did not overlap with the original is a
+  new original and executes `fn` again, even before `ResultTTL` expires.
 - **Nanosecond-close arrivals:** if five requests with the same key enter
   `Do` at effectively the same time, one becomes the original and the other
   four wait/read the stored result; the handler is not selected by comparing
@@ -194,7 +198,7 @@ The guarantee depends on these operational assumptions:
   lease cannot be renewed until it expires, another caller can acquire the lock
   and execute `fn` again.
 - If the original returns an error, its error is propagated to waiters and no
-  successful result is cached.
+  successful result is stored for hand-off.
 - If a process crashes or loses Redis connectivity mid-flight, the lock TTL is
   the recovery mechanism; use an idempotent business operation when you need
   end-to-end exactly-once side effects.
@@ -274,7 +278,7 @@ func examples() {
 
 | Option      | Default    | Description                                           |
 |-------------|------------|-------------------------------------------------------|
-| `ResultTTL` | `30s`      | How long a completed result is kept in `ResultStore`. |
+| `ResultTTL` | `30s`      | How long a completed result is kept in `ResultStore` for in-flight duplicate waiters; not a response-cache TTL. |
 | `Now`       | `time.Now` | Clock override — useful in tests.                     |
 
 Redis coordinator options (`coordinator/redis.Options`):

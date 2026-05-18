@@ -7,7 +7,7 @@
 //
 // Use this store together with [coordinator/singleflight] for single-process
 // deployments. For multi-instance deployments use [store/redis] so that all
-// instances share the same result cache.
+// instances share the same result hand-off.
 package inmemory
 
 import (
