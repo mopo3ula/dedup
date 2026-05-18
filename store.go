@@ -10,8 +10,8 @@ import (
 // the given key (either it never existed or its TTL has elapsed).
 var ErrNotFound = errors.New("dedup: result not found")
 
-// ResultStore persists completed request results as a short-lived hand-off for
-// duplicate waiters that were already in-flight while the original was running.
+// ResultStore persists completed request results so that duplicates arriving
+// after the original finishes can be served instantly from cache.
 //
 // Implementations must:
 //   - Enforce TTL: [Get] must return [ErrNotFound] for expired entries.

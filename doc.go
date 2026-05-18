@@ -5,9 +5,8 @@
 // When multiple identical requests with the same deduplication key arrive
 // concurrently, one caller becomes the "original" and executes the handler.
 // Duplicates block until the original finishes and receive the same [Envelope].
-// Later requests that start after the original has completed execute the
-// handler again; [ResultStore] is only a short-lived hand-off for waiters that
-// were already in-flight.
+// Subsequent requests within the ResultTTL window are served instantly from the
+// [ResultStore] without invoking the handler again.
 //
 // # Guarantees and limits
 //
@@ -29,7 +28,7 @@
 // # Core abstractions
 //
 //   - [Coordinator] – decides which call is the "original" and blocks duplicates.
-//   - [ResultStore] – persists completed results for duplicate-waiter fan-out.
+//   - [ResultStore] – persists completed results for fast fan-out.
 //   - [Envelope] – transport-agnostic container for the response payload and metadata.
 //   - [Deduplicator] – wires the above together; the single entry point via [Deduplicator.Do].
 //
