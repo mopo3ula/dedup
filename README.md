@@ -4,8 +4,9 @@ Transparent request deduplication for Go services.
 When multiple identical requests with the same deduplication key arrive
 concurrently, only one request becomes the **original** and executes the
 handler. All duplicates block and receive **the same result** the moment the
-original finishes. Later requests that start after the original has completed
-execute the handler again; completed results are not used as a response cache.
+original finishes. Later requests execute the handler again after the
+coordinator's in-flight window has closed; completed results are only a
+short-lived duplicate hand-off, not a long-lived response cache.
 
 ## Features
 
@@ -155,21 +156,22 @@ Request C ──► Do(ctx, key, fn) ──► Coordinator.Run ──► fn() ex
 
 1. **A** acquires the coordinator lock and runs `fn`.
 2. **B** arrives while **A** is running — blocks in the coordinator.
-3. **A** finishes → stores result in `ResultStore` → releases lock → notifies **B**.
+3. **A** finishes → stores result in `ResultStore` → marks completion → notifies **B**.
 4. **B** wakes up, reads result from `ResultStore`, returns the same `Envelope`.
-5. **C** arrives after **A** finishes → it does not overlap with **A**, so it becomes a new original and runs `fn` again.
+5. **C** arrives after the coordinator's in-flight/completion window has closed, so it becomes a new original and runs `fn` again.
 
-`ResultStore` is only a short-lived hand-off channel for waiters that were
-already in-flight while the original was running. `ResultTTL` controls how long
-that hand-off remains readable; it is not a response-cache window.
+`ResultStore` is only a short-lived hand-off channel for duplicate waiters.
+`ResultTTL` controls how long that hand-off remains readable; it is not a
+long-lived response-cache window. With the Redis coordinator, keep `ResultTTL`
+longer than `coordinator/redis.Options.CompletionTTL` so callers suppressed by
+the post-completion burst window can still read the stored result.
 
 Correctness does not rely on artificial sleeps or millisecond-sized gaps between
 requests: callers that arrive nanoseconds apart are coordinated by the
-coordinator's lock/singleflight primitive, not by timestamp comparison. This was
-already the core behaviour for simultaneous calls with the same key; the Redis
-coordinator additionally re-checks the lock immediately after subscribing so a
-completion published in the tiny subscribe race window is observed without
-waiting for the polling fallback.
+coordinator's lock/singleflight primitive, not by timestamp comparison. The
+Redis coordinator additionally keeps a short completed marker after a successful
+original finishes. That marker closes the race where a very fast handler releases
+the active lock before all members of the same request burst have reached Redis.
 
 ## Guarantees and limits
 
@@ -180,8 +182,9 @@ For a given deduplication key, `dedup` coalesces concurrent calls as follows:
 - **Multiple instances:** `coordinator/redis` uses Redis `SET NX` as a shared
   distributed lock, so all instances that use the same Redis client namespace
   compete for one original caller.
-- **After success:** a later call that did not overlap with the original is a
-  new original and executes `fn` again, even before `ResultTTL` expires.
+- **After success:** a later call is a new original after the coordinator's
+  in-flight window has closed, even before `ResultTTL` expires. For Redis, the
+  default post-completion burst window is `CompletionTTL` (`100ms`).
 - **Nanosecond-close arrivals:** if five requests with the same key enter
   `Do` at effectively the same time, one becomes the original and the other
   four wait/read the stored result; the handler is not selected by comparing
@@ -197,6 +200,10 @@ The guarantee depends on these operational assumptions:
   hiccups and scheduler pauses between renewals. If the process crashes or the
   lease cannot be renewed until it expires, another caller can acquire the lock
   and execute `fn` again.
+- `coordinator/redis.Options.CompletionTTL` keeps a completed marker briefly
+  after Redis originals finish. Increase it if same-burst callers routinely
+  arrive at Redis after very fast handlers finish; keep `dedup.Options.ResultTTL`
+  greater than this value.
 - If the original returns an error, its error is propagated to waiters and no
   successful result is stored for hand-off.
 - If a process crashes or loses Redis connectivity mid-flight, the lock TTL is
@@ -285,9 +292,10 @@ Redis coordinator options (`coordinator/redis.Options`):
 
 | Option     | Default   | Description                                                            |
 |------------|-----------|------------------------------------------------------------------------|
-| `LockTTL`  | `5s`      | Redis lock lease duration. The original renews it while `fn` runs; choose a value long enough for short Redis hiccups and scheduler pauses. |
-| `WaitStep` | `20ms`    | Polling interval for the fallback lock-exists check.                   |
-| `Prefix`   | `"dedup"` | Redis key namespace.                                                   |
+| `LockTTL`       | `5s`      | Redis lock lease duration. The original renews it while `fn` runs; choose a value long enough for short Redis hiccups and scheduler pauses. |
+| `WaitStep`      | `20ms`    | Polling interval for the fallback lock/completion check.               |
+| `Prefix`        | `"dedup"` | Redis key namespace.                                                   |
+| `CompletionTTL` | `100ms`   | Short post-completion window that suppresses second originals from the same near-simultaneous burst; keep `ResultTTL` greater than this. |
 
 ## Requirements
 
