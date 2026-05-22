@@ -11,15 +11,20 @@ import (
 type EventKind string
 
 const (
-	// EventCacheHit is fired when the fast-path cache lookup returns a result.
+	// EventCacheHit is kept for backwards compatibility but is no longer emitted.
+	//
+	// Deprecated: dedup no longer caches results beyond the in-flight window.
 	EventCacheHit EventKind = "cache_hit"
-	// EventCacheMiss is fired when the fast-path cache lookup finds nothing.
+	// EventCacheMiss is kept for backwards compatibility but is no longer emitted.
+	//
+	// Deprecated: dedup no longer caches results beyond the in-flight window.
 	EventCacheMiss EventKind = "cache_miss"
 	// EventOriginal is fired when this caller becomes the original executor.
 	// fn will be called next.
 	EventOriginal EventKind = "original"
-	// EventInnerCacheHit is fired when the inner (post-lock) cache check
-	// finds a previously stored result, so fn is skipped.
+	// EventInnerCacheHit is kept for backwards compatibility but is no longer emitted.
+	//
+	// Deprecated: dedup no longer caches results beyond the in-flight window.
 	EventInnerCacheHit EventKind = "inner_cache_hit"
 	// EventDuplicate is fired when this caller was a duplicate waiter and the
 	// original has now completed.
@@ -41,8 +46,9 @@ type Event struct {
 // Options configures [Deduplicator] behaviour.
 type Options struct {
 	// ResultTTL controls how long a completed result is kept in [ResultStore].
-	// Requests arriving within this window after the original finishes are
-	// served from cache without re-executing the handler.
+	// The store is used by coordinators (such as [coordinator/redis]) to share
+	// the result with in-flight duplicate waiters across instances. Requests
+	// arriving after the in-flight group completes always re-execute the handler.
 	// Default: 30s.
 	ResultTTL time.Duration
 
@@ -51,9 +57,9 @@ type Options struct {
 	Now func() time.Time
 
 	// OnEvent, if non-nil, is called synchronously for every notable internal
-	// decision: cache hits/misses, coordinator role (original vs duplicate),
-	// and inner-cache hits that skip fn. Useful for metrics and debugging.
-	// The callback must not block for long; it runs in the caller's goroutine.
+	// decision: coordinator role (original vs duplicate). Useful for metrics
+	// and debugging. The callback must not block for long; it runs in the
+	// caller's goroutine.
 	OnEvent func(e Event)
 }
 
@@ -133,23 +139,23 @@ func MustNew(store ResultStore, coordinator Coordinator, opt *Options) *Deduplic
 	return d
 }
 
-// Do executes fn at most once per key within the [Options.ResultTTL] window.
+// Do deduplicates concurrent calls with the same key.
 // It returns an error if key is empty or fn is nil.
 //
 // Behaviour:
-//   - If a result for key is already cached in [ResultStore], it is returned
-//     immediately without calling fn.
 //   - If an identical key is currently in-flight, Do blocks until the original
 //     finishes and then returns the same [Envelope].
-//   - Otherwise fn is executed as the "original", its result is stored in
-//     [ResultStore], and returned.
+//   - Otherwise fn is executed as the "original" and its result is returned
+//     to all concurrent waiters.
+//   - Requests that arrive after the in-flight group completes always call fn
+//     again as a new original.
 //
 // fn receives a context derived from ctx that preserves ctx values while
 // ignoring ctx cancellation. Cancelling ctx interrupts duplicate waiters but
 // does not abort an already-running original.
 //
 // The returned [Envelope] is always a fresh deep copy; callers may mutate it
-// freely without affecting cached data.
+// freely without affecting other callers.
 func (d *Deduplicator) Do(
 	ctx context.Context,
 	key string,
@@ -162,53 +168,9 @@ func (d *Deduplicator) Do(
 		return nil, errors.New("dedup: key is empty")
 	}
 
-	// Fast path: result already in store.
-	if cached, err := d.store.Get(ctx, key); err == nil {
-		if d.opt.OnEvent != nil {
-			d.opt.OnEvent(Event{
-				Kind: EventCacheHit,
-				Key:  key,
-			})
-		}
-		return cached.clone(), nil
-	} else if !errors.Is(err, ErrNotFound) {
-		return nil, err
-	}
-
-	if d.opt.OnEvent != nil {
-		d.opt.OnEvent(Event{
-			Kind: EventCacheMiss,
-			Key:  key,
-		})
-	}
-
 	result, err := d.coordinator.Run(ctx, key, func(execCtx context.Context) (*Envelope, error) {
-		// Store operations use a detached context so that a cancelled or
-		// expired caller context (e.g. gRPC deadline) does not prevent the
-		// result from being written to the store. A failed store.Set would
-		// release the coordinator lock without caching the result, allowing
-		// the next caller to become the new original and execute fn again.
-		storeCtx := context.WithoutCancel(execCtx)
-
-		// Another goroutine may have stored the result while we were acquiring
-		// the coordinator lock; avoid redundant fn calls.
-		if cached, cacheErr := d.store.Get(storeCtx, key); cacheErr == nil {
-			if d.opt.OnEvent != nil {
-				d.opt.OnEvent(Event{
-					Kind: EventInnerCacheHit,
-					Key:  key,
-				})
-			}
-			return cached.clone(), nil
-		} else if !errors.Is(cacheErr, ErrNotFound) {
-			return nil, cacheErr
-		}
-
 		if d.opt.OnEvent != nil {
-			d.opt.OnEvent(Event{
-				Kind: EventOriginal,
-				Key:  key,
-			})
+			d.opt.OnEvent(Event{Kind: EventOriginal, Key: key})
 		}
 
 		res, callErr := fn(execCtx)
@@ -221,6 +183,12 @@ func (d *Deduplicator) Do(
 
 		res = res.clone()
 		res.CreatedAt = d.opt.Now().UTC()
+
+		// Store the result so that in-flight duplicate waiters on other
+		// instances (e.g. coordinator/redis) can fetch it. A detached context
+		// is used so that a cancelled caller context (e.g. gRPC deadline) does
+		// not prevent the write.
+		storeCtx := context.WithoutCancel(execCtx)
 		if setErr := d.store.Set(storeCtx, key, res, d.opt.ResultTTL); setErr != nil {
 			return nil, setErr
 		}
@@ -234,10 +202,9 @@ func (d *Deduplicator) Do(
 		return nil, err
 	}
 
-	// We were a duplicate waiter; the original has stored the result.
-	// Use a detached context: the caller's context may have been cancelled
-	// by the time we reach this point, but the result is already in the
-	// store so the read must succeed regardless.
+	// ErrWaitCompleted: we were a duplicate waiter and the original has stored
+	// the result. Use a detached context — the caller's context may have been
+	// cancelled by the time we reach this point.
 	cached, fetchErr := d.store.Get(context.WithoutCancel(ctx), key)
 	if fetchErr != nil {
 		return nil, fetchErr

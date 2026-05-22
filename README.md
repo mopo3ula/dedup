@@ -149,20 +149,19 @@ github.com/mopo3ula/dedup
 
 ```
 Request A ──► Do(ctx, key, fn) ──► Coordinator.Run ──► fn() executes ──► ResultStore.Set ──► respond
-Request B ──► Do(ctx, key, fn) ──► Coordinator.Run ──► blocks ──────────────────────────► respond (same Envelope)
-Request C ──► Do(ctx, key, fn) ──► ResultStore.Get ─────────────────────────────────── respond instantly (cached)
+Request B ──► Do(ctx, key, fn) ──► Coordinator.Run ──► blocks until A ───────────────────► respond (same Envelope)
+Request C ──► Do(ctx, key, fn) ──► Coordinator.Run ──► fn() executes ──► ResultStore.Set ──► respond
 ```
 
 1. **A** acquires the coordinator lock and runs `fn`.
 2. **B** arrives while **A** is running — blocks in the coordinator.
 3. **A** finishes → stores result in `ResultStore` → releases lock → notifies **B**.
 4. **B** wakes up, reads result from `ResultStore`, returns the same `Envelope`.
-5. **C** arrives after **A** finishes → `ResultStore.Get` returns immediately (within TTL).
+5. **C** arrives after **A** and **B** complete — becomes a new original and calls `fn` again.
 
 Correctness does not rely on artificial sleeps or millisecond-sized gaps between
 requests: callers that arrive nanoseconds apart are coordinated by the
-coordinator's lock/singleflight primitive, not by timestamp comparison. This was
-already the core behaviour for simultaneous calls with the same key; the Redis
+coordinator's lock/singleflight primitive, not by timestamp comparison. The Redis
 coordinator additionally re-checks the lock immediately after subscribing so a
 completion published in the tiny subscribe race window is observed without
 waiting for the polling fallback.
@@ -176,12 +175,12 @@ For a given deduplication key, `dedup` coalesces concurrent calls as follows:
 - **Multiple instances:** `coordinator/redis` uses Redis `SET NX` as a shared
   distributed lock, so all instances that use the same Redis client namespace
   compete for one original caller.
-- **After success:** the original stores the completed `Envelope` in
-  `ResultStore`, and calls arriving within `ResultTTL` are served from cache.
-- **Nanosecond-close arrivals:** if five requests with the same key enter
-  `Do` at effectively the same time, one becomes the original and the other
-  four wait/read the stored result; the handler is not selected by comparing
-  timestamps.
+- **After the in-flight group completes:** the next call with the same key
+  becomes a new original and executes `fn` again. Results are not cached between
+  flights.
+- **Simultaneous arrivals:** if five requests with the same key enter `Do`
+  at the same time, one becomes the original and the other four wait for its
+  result; the handler is not selected by comparing timestamps.
 
 The guarantee depends on these operational assumptions:
 
@@ -194,7 +193,7 @@ The guarantee depends on these operational assumptions:
   lease cannot be renewed until it expires, another caller can acquire the lock
   and execute `fn` again.
 - If the original returns an error, its error is propagated to waiters and no
-  successful result is cached.
+  result is stored.
 - If a process crashes or loses Redis connectivity mid-flight, the lock TTL is
   the recovery mechanism; use an idempotent business operation when you need
   end-to-end exactly-once side effects.
@@ -274,7 +273,7 @@ func examples() {
 
 | Option      | Default    | Description                                           |
 |-------------|------------|-------------------------------------------------------|
-| `ResultTTL` | `30s`      | How long a completed result is kept in `ResultStore`. |
+| `ResultTTL` | `30s`      | How long the result is kept in `ResultStore` for in-flight duplicate waiters (e.g. across instances with `coordinator/redis`). |
 | `Now`       | `time.Now` | Clock override — useful in tests.                     |
 
 Redis coordinator options (`coordinator/redis.Options`):

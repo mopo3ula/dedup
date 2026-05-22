@@ -5,8 +5,8 @@
 // When multiple identical requests with the same deduplication key arrive
 // concurrently, one caller becomes the "original" and executes the handler.
 // Duplicates block until the original finishes and receive the same [Envelope].
-// Subsequent requests within the ResultTTL window are served instantly from the
-// [ResultStore] without invoking the handler again.
+// Requests that arrive after the in-flight group completes always execute the
+// handler again as a new original — results are not cached between flights.
 //
 // # Guarantees and limits
 //
@@ -28,7 +28,8 @@
 // # Core abstractions
 //
 //   - [Coordinator] – decides which call is the "original" and blocks duplicates.
-//   - [ResultStore] – persists completed results for fast fan-out.
+//   - [ResultStore] – temporarily holds the completed result so in-flight
+//     duplicate waiters on other instances can fetch it.
 //   - [Envelope] – transport-agnostic container for the response payload and metadata.
 //   - [Deduplicator] – wires the above together; the single entry point via [Deduplicator.Do].
 //
@@ -51,7 +52,7 @@
 //	d, err := dedup.New(
 //	    inmemory.New(),
 //	    singleflight.New(),
-//	    &dedup.Options{ResultTTL: 30 * time.Second},
+//	    nil,
 //	)
 //	if err != nil {
 //	    return err
@@ -63,7 +64,7 @@
 //	d, err := dedup.New(
 //	    redistore.New(rdb, "myapp:result:"),
 //	    rediscoord.New(rdb, nil),
-//	    &dedup.Options{ResultTTL: 30 * time.Second},
+//	    nil,
 //	)
 //	if err != nil {
 //	    return err

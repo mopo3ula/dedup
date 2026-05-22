@@ -41,12 +41,10 @@ func expensiveQuery(ctx context.Context, id string) (*dedup.Envelope, error) {
 
 func main() {
 	// Create a Deduplicator with an in-memory store and singleflight coordinator.
-	// ResultTTL=5s means repeated requests within 5 seconds return the cached
-	// result without invoking the handler again.
 	d, err := dedup.New(
 		inmemory.New(),
 		singleflight.New(),
-		&dedup.Options{ResultTTL: 5 * time.Second},
+		nil,
 	)
 	if err != nil {
 		panic(err)
@@ -74,15 +72,17 @@ func main() {
 	}
 	wg.Wait()
 
-	// --- Example 2: repeated request is served from cache ---
-	fmt.Println("\n=== Example 2: repeated request (should be served from cache) ===")
+	// --- Example 2: sequential request after the group completes ---
+	// The in-flight group from Example 1 has finished, so this request becomes
+	// a new original and the handler is executed again.
+	fmt.Println("\n=== Example 2: sequential request after group completes — handler runs again ===")
 	env, err := d.Do(ctx, "user:1", func(ctx context.Context) (*dedup.Envelope, error) {
 		return expensiveQuery(ctx, "1")
 	})
 	if err != nil {
 		fmt.Printf("error: %v\n", err)
 	} else {
-		fmt.Printf("cached result: payload=%s\n", env.Payload)
+		fmt.Printf("result: payload=%s\n", env.Payload)
 	}
 
 	// --- Example 3: different key is executed independently ---
