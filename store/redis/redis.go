@@ -1,8 +1,8 @@
 // Package redis provides a [dedup.ResultStore] backed by Redis.
 //
 // Results are JSON-serialised and stored with the given TTL. Use this store
-// together with [coordinator/redis] so that all service instances share the
-// same completed-result cache.
+// together with [coordinator/redis] so that in-flight duplicate waiters on
+// other instances can fetch the result after the original finishes.
 package redis
 
 import (

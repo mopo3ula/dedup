@@ -34,8 +34,8 @@ func main() {
 	}
 
 	// Create a Deduplicator with a Redis store and Redis coordinator.
-	// All application instances sharing the same Redis will share the result
-	// cache and the distributed lock.
+	// All application instances sharing the same Redis will coordinate via a
+	// distributed lock and share in-flight results.
 	d, err := dedup.New(
 		redistore.New(rdb, "myapp:result:"),
 		rediscoord.New(rdb, &rediscoord.Options{
@@ -67,15 +67,17 @@ func main() {
 	}
 	wg.Wait()
 
-	// --- Example 2: repeated request is served from Redis cache ---
-	fmt.Println("\n=== Example 2: repeated request (served from Redis cache) ===")
+	// --- Example 2: sequential request after the group completes ---
+	// The in-flight group from Example 1 has finished, so this request becomes
+	// a new original and the handler is executed again.
+	fmt.Println("\n=== Example 2: sequential request after group completes — handler runs again ===")
 	env, err := d.Do(ctx, "order:42", func(ctx context.Context) (*dedup.Envelope, error) {
 		return processOrder(ctx, "42")
 	})
 	if err != nil {
 		fmt.Printf("error: %v\n", err)
 	} else {
-		fmt.Printf("from Redis cache: payload=%s createdAt=%s\n",
+		fmt.Printf("result: payload=%s createdAt=%s\n",
 			env.Payload, env.CreatedAt.Format(time.RFC3339))
 	}
 

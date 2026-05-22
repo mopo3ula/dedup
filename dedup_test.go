@@ -151,16 +151,16 @@ func TestDeduplicatesConcurrentCalls(t *testing.T) {
 
 // TestDeduplicatesNanosecondCloseCalls verifies that correctness does not
 // depend on requests being separated by scheduler-scale delays. A duplicate
-// that starts one nanosecond after the original still waits for the original
+// that starts while the original is in-flight still waits for the original
 // and receives its result instead of executing the handler again.
 func TestDeduplicatesNanosecondCloseCalls(t *testing.T) {
 	d := newTestDeduplicator(time.Second)
 
-	var originCalls int64
+	var calls int64
 	started := make(chan struct{})
 	release := make(chan struct{})
 	handler := func(ctx context.Context) (*dedup.Envelope, error) {
-		if atomic.AddInt64(&originCalls, 1) == 1 {
+		if atomic.AddInt64(&calls, 1) == 1 {
 			close(started)
 		}
 		select {
@@ -191,7 +191,6 @@ func TestDeduplicatesNanosecondCloseCalls(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("handler did not start")
 	}
-	time.Sleep(time.Nanosecond)
 
 	go func() {
 		env, err := d.Do(context.Background(), "nanosecond-key", handler)
@@ -202,6 +201,9 @@ func TestDeduplicatesNanosecondCloseCalls(t *testing.T) {
 		results <- callResult{payload: string(env.Payload)}
 	}()
 
+	// Give goroutine 2 time to enter d.Do and block in the coordinator before
+	// the original's fn returns.
+	time.Sleep(5 * time.Millisecond)
 	close(release)
 
 	for range 2 {
@@ -218,69 +220,35 @@ func TestDeduplicatesNanosecondCloseCalls(t *testing.T) {
 		}
 	}
 
-	if got := atomic.LoadInt64(&originCalls); got != 1 {
+	if got := atomic.LoadInt64(&calls); got != 1 {
 		t.Fatalf("handler called %d times, want exactly 1", got)
 	}
 }
 
-// TestCachedResultReturnedImmediately verifies that a second call with the
-// same key after the original finishes is served from cache without calling
-// the handler again and returns in well under 1 ms.
-func TestCachedResultReturnedImmediately(t *testing.T) {
+// TestSequentialCallsEachExecuteHandler verifies that requests arriving after
+// the in-flight group completes are not served from any cache — each becomes
+// a new original and the handler is executed every time.
+func TestSequentialCallsEachExecuteHandler(t *testing.T) {
 	d := newTestDeduplicator(time.Second)
-	var originCalls int64
+	var calls int64
 
 	handler := func(ctx context.Context) (*dedup.Envelope, error) {
-		atomic.AddInt64(&originCalls, 1)
-		time.Sleep(80 * time.Millisecond)
-		return &dedup.Envelope{Payload: []byte("hello")}, nil
+		n := atomic.AddInt64(&calls, 1)
+		return &dedup.Envelope{Payload: []byte{byte(n)}}, nil
 	}
 
-	if _, err := d.Do(context.Background(), "k", handler); err != nil {
-		t.Fatalf("first call: %v", err)
+	for i := range 3 {
+		env, err := d.Do(context.Background(), "seq-key", handler)
+		if err != nil {
+			t.Fatalf("call %d: %v", i, err)
+		}
+		if want := byte(i + 1); env.Payload[0] != want {
+			t.Fatalf("call %d: payload = %d, want %d", i, env.Payload[0], want)
+		}
 	}
 
-	start := time.Now()
-	env, err := d.Do(context.Background(), "k", handler)
-	if err != nil {
-		t.Fatalf("second call: %v", err)
-	}
-	elapsed := time.Since(start)
-
-	if string(env.Payload) != "hello" {
-		t.Fatalf("payload = %q, want \"hello\"", env.Payload)
-	}
-	if got := atomic.LoadInt64(&originCalls); got != 1 {
-		t.Fatalf("handler called %d times after cache hit, want 1", got)
-	}
-	if elapsed > 5*time.Millisecond {
-		t.Fatalf("cached response took %v, want < 5ms", elapsed)
-	}
-}
-
-// TestExpiredCacheCallsHandlerAgain verifies that after ResultTTL elapses the
-// handler is invoked again on the next call.
-func TestExpiredCacheCallsHandlerAgain(t *testing.T) {
-	d := newTestDeduplicator(50 * time.Millisecond)
-	var originCalls int64
-
-	handler := func(ctx context.Context) (*dedup.Envelope, error) {
-		atomic.AddInt64(&originCalls, 1)
-		return &dedup.Envelope{Payload: []byte("v")}, nil
-	}
-
-	if _, err := d.Do(context.Background(), "k2", handler); err != nil {
-		t.Fatalf("first call: %v", err)
-	}
-
-	time.Sleep(100 * time.Millisecond) // let TTL expire
-
-	if _, err := d.Do(context.Background(), "k2", handler); err != nil {
-		t.Fatalf("second call: %v", err)
-	}
-
-	if got := atomic.LoadInt64(&originCalls); got != 2 {
-		t.Fatalf("handler called %d times, want 2 (TTL expired)", got)
+	if got := atomic.LoadInt64(&calls); got != 3 {
+		t.Fatalf("handler called %d times, want 3", got)
 	}
 }
 
@@ -319,54 +287,10 @@ func TestNilEnvelopeWithoutErrorReturnsMeaningfulError(t *testing.T) {
 	}
 }
 
-// TestStoreSetWithCancelledContext verifies that cancelling the caller's
-// context after fn returns does not prevent the result from being cached.
-// Before the fix, store.Set used execCtx (the caller's context); if that
-// context was cancelled between fn returning and store.Set running, the
-// result was never cached and the next caller would execute fn again —
-// reproducing the bug where a gRPC deadline fired mid-operation.
-func TestStoreSetWithCancelledContext(t *testing.T) {
-	d := newTestDeduplicator(time.Second)
-	var calls int64
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	// First call: context is cancelled inside fn().
-	// The singleflight coordinator may return context.Canceled to this caller,
-	// but fn itself must still complete and cache the result.
-	_, _ = d.Do(ctx, "cancel-key", func(_ context.Context) (*dedup.Envelope, error) {
-		atomic.AddInt64(&calls, 1)
-		cancel() // simulate: gRPC deadline fires while fn is still running
-		return &dedup.Envelope{Payload: []byte("ok")}, nil
-	})
-
-	// Give the background goroutine (singleflight) time to finish storing.
-	time.Sleep(20 * time.Millisecond)
-
-	// Second call with a fresh context: must hit the cache — fn must NOT run again.
-	env, err := d.Do(context.Background(), "cancel-key", func(_ context.Context) (*dedup.Envelope, error) {
-		atomic.AddInt64(&calls, 1)
-		return &dedup.Envelope{Payload: []byte("second")}, nil
-	})
-	if err != nil {
-		t.Fatalf("second Do: unexpected error: %v", err)
-	}
-	if string(env.Payload) != "ok" {
-		t.Fatalf("payload = %q, want \"ok\" (cached result)", string(env.Payload))
-	}
-	if got := atomic.LoadInt64(&calls); got != 1 {
-		t.Fatalf("fn called %d times, want 1 (result must be cached despite context cancellation)", got)
-	}
-}
-
-// already cached in the in-memory store.
-func BenchmarkHotKeyCached(b *testing.B) {
+func BenchmarkInflightDedup(b *testing.B) {
 	d := newTestDeduplicator(time.Minute)
 	handler := func(ctx context.Context) (*dedup.Envelope, error) {
 		return &dedup.Envelope{Payload: []byte("ok")}, nil
-	}
-	if _, err := d.Do(context.Background(), "bench-key", handler); err != nil {
-		b.Fatalf("warmup: %v", err)
 	}
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {

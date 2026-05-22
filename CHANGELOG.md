@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [unreleased]
 
+### Changed
+
+- **Breaking behaviour**: results are no longer cached between in-flight groups.
+  Requests arriving after the in-flight group completes always execute the handler
+  again as a new original. Previously, results were cached in `ResultStore` for
+  `ResultTTL` (default 30 s) and sequential requests within that window were
+  served without calling the handler.
+- `ResultStore` now acts as a transient channel for passing the result to
+  in-flight duplicate waiters on other instances (`coordinator/redis`); it is not
+  a cache for future requests.
+- `EventCacheHit`, `EventCacheMiss`, and `EventInnerCacheHit` are kept as
+  exported constants for backwards compatibility but are no longer emitted.
+
 ### Added
 
 - Core `Deduplicator` with `Do(ctx, key, fn)` API.
@@ -17,5 +30,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - `store/inmemory` – in-process map with TTL eviction.
     - `store/redis` – Redis-backed, JSON-serialised results.
 - `key` package with `FromParts`, `FromJSON`, `FromMap` helpers.
-- Full test suite including concurrency, cache-hit, TTL-expiry, and benchmark tests.
+- Full test suite including concurrency and benchmark tests.
 
