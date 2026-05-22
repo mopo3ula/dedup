@@ -31,29 +31,42 @@ Integration tests are gated with the `integration` build tag, so `go test ./...`
 
 The library deduplicates concurrent identical requests via two pluggable interfaces:
 
-- **`Coordinator`** (`coordinator.go`) — decides which concurrent caller is the "original" and blocks all duplicates. Returns `ErrWaitCompleted` to signal that a waiter should fetch the result from the store rather than use the return value.
-- **`ResultStore`** (`store.go`) — holds the result transiently so in-flight duplicate waiters on other instances (`coordinator/redis`) can fetch it. Not a cache: sequential requests after the in-flight group completes always run `fn` again. Returns `ErrNotFound` for absent/expired keys.
+- **`Coordinator`** (`coordinator.go`) — decides which concurrent caller is the "original" and blocks all duplicates.
+  Returns `ErrWaitCompleted` to signal that a waiter should fetch the result from the store rather than use the return
+  value.
+- **`ResultStore`** (`store.go`) — holds the result transiently so in-flight duplicate waiters on other instances (
+  `coordinator/redis`) can fetch it. Not a cache: sequential requests after the in-flight group completes always run
+  `fn` again. Returns `ErrNotFound` for absent/expired keys.
 
 **`Deduplicator.Do`** (`dedup.go`) wires them together:
-1. `coordinator.Run` — acquire the lock and call `fn` (or block if another caller already holds it). Requests arriving after the in-flight group completes always become new originals and run `fn` again — there is no result cache between flights.
-2. Inside the coordinator closure: call `fn`, then `store.Set` the result so in-flight duplicate waiters on other instances (Redis coordinator) can fetch it. `store.Set` uses a detached context so a cancelled caller cannot prevent the write.
-3. On `ErrWaitCompleted` (returned by Redis coordinator for waiters): fetch the result from the store using a detached context (caller context may already be cancelled).
+
+1. `coordinator.Run` — acquire the lock and call `fn` (or block if another caller already holds it). Requests arriving
+   after the in-flight group completes always become new originals and run `fn` again — there is no result cache between
+   flights.
+2. Inside the coordinator closure: call `fn`, then `store.Set` the result so in-flight duplicate waiters on other
+   instances (Redis coordinator) can fetch it. `store.Set` uses a detached context so a cancelled caller cannot prevent
+   the write.
+3. On `ErrWaitCompleted` (returned by Redis coordinator for waiters): fetch the result from the store using a detached
+   context (caller context may already be cancelled).
 
 ### Implementations
 
-| Package | Type | Mechanism |
-|---|---|---|
-| `coordinator/singleflight` | `Coordinator` | `golang.org/x/sync/singleflight` — in-process only |
-| `coordinator/redis` | `Coordinator` | Redis SET NX leader election + Pub/Sub done-channel + periodic polling fallback + lock renewal goroutine (every `LockTTL/3`) |
-| `store/inmemory` | `ResultStore` | `sync.RWMutex` map with TTL |
-| `store/redis` | `ResultStore` | Redis `SET EX` with JSON serialisation |
+| Package                    | Type          | Mechanism                                                                                                                    |
+|----------------------------|---------------|------------------------------------------------------------------------------------------------------------------------------|
+| `coordinator/singleflight` | `Coordinator` | `golang.org/x/sync/singleflight` — in-process only                                                                           |
+| `coordinator/redis`        | `Coordinator` | Redis SET NX leader election + Pub/Sub done-channel + periodic polling fallback + lock renewal goroutine (every `LockTTL/3`) |
+| `store/inmemory`           | `ResultStore` | `sync.RWMutex` map with TTL                                                                                                  |
+| `store/redis`              | `ResultStore` | Redis `SET EX` with JSON serialisation                                                                                       |
 
-The Redis coordinator uses Lua CAS scripts for atomic lock extension and release to prevent accidental deletion by a different owner.
+The Redis coordinator uses Lua CAS scripts for atomic lock extension and release to prevent accidental deletion by a
+different owner.
 
 ### Key building (`key/`)
 
-`key.FromParts`, `key.FromMap`, and `key.FromJSON` all produce a stable SHA-256 hex string. Use these to build the deduplication key from request parameters.
+`key.FromParts`, `key.FromMap`, and `key.FromJSON` all produce a stable SHA-256 hex string. Use these to build the
+deduplication key from request parameters.
 
 ### Extending
 
-Implement `Coordinator` or `ResultStore` interfaces to plug in any backend. The interfaces are small — one method each. See `coordinator.go` and `store.go` for the contracts.
+Implement `Coordinator` or `ResultStore` interfaces to plug in any backend. The interfaces are small — one method each.
+See `coordinator.go` and `store.go` for the contracts.

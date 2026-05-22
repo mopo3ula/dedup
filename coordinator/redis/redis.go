@@ -50,6 +50,41 @@ type Options struct {
 	// OnLockMissed, if non-nil, is called when SET NX fails — this caller is a
 	// duplicate and will wait for the original to finish.
 	OnLockMissed func(key, coordinatorID string)
+
+	// MarshalError, if non-nil, serialises an error returned by fn into bytes
+	// for storage in Redis so that duplicate waiters on other instances can
+	// reconstruct it. The default implementation stores err.Error() as a plain
+	// UTF-8 string. Override this to preserve structured error types such as
+	// gRPC status codes:
+	//
+	//	import "google.golang.org/grpc/status"
+	//	import "google.golang.org/protobuf/proto"
+	//
+	//	opt.MarshalError = func(err error) ([]byte, error) {
+	//	    st, ok := status.FromError(err)
+	//	    if !ok {
+	//	        return []byte(err.Error()), nil
+	//	    }
+	//	    return proto.Marshal(st.Proto())
+	//	}
+	MarshalError func(err error) ([]byte, error)
+
+	// UnmarshalError, if non-nil, deserialises bytes previously written by
+	// [MarshalError] back into a Go error. The default implementation wraps the
+	// bytes as a plain string error. Override this together with [MarshalError]:
+	//
+	//	import spb "google.golang.org/genproto/googleapis/rpc/status"
+	//	import "google.golang.org/grpc/status"
+	//	import "google.golang.org/protobuf/proto"
+	//
+	//	opt.UnmarshalError = func(b []byte) error {
+	//	    var s spb.Status
+	//	    if proto.Unmarshal(b, &s) == nil {
+	//	        return status.FromProto(&s).Err()
+	//	    }
+	//	    return errors.New(string(b))
+	//	}
+	UnmarshalError func(b []byte) error
 }
 
 // ErrLockLost is returned by [Coordinator.Run] when the original executor
@@ -69,6 +104,8 @@ type Coordinator struct {
 	errPrefix      string
 	onLockAcquired func(key, coordinatorID string)
 	onLockMissed   func(key, coordinatorID string)
+	marshalError   func(err error) ([]byte, error)
+	unmarshalError func(b []byte) error
 }
 
 // New creates a Coordinator using the provided Redis client.
@@ -80,6 +117,8 @@ func New(client goredis.UniversalClient, opt *Options) *Coordinator {
 		Prefix:   "dedup",
 	}
 	var onAcquired, onMissed func(key, coordinatorID string)
+	marshalErr := func(err error) ([]byte, error) { return []byte(err.Error()), nil }
+	unmarshalErr := func(b []byte) error { return errors.New(string(b)) }
 	if opt != nil {
 		if opt.LockTTL > 0 {
 			cfg.LockTTL = opt.LockTTL
@@ -92,6 +131,12 @@ func New(client goredis.UniversalClient, opt *Options) *Coordinator {
 		}
 		onAcquired = opt.OnLockAcquired
 		onMissed = opt.OnLockMissed
+		if opt.MarshalError != nil {
+			marshalErr = opt.MarshalError
+		}
+		if opt.UnmarshalError != nil {
+			unmarshalErr = opt.UnmarshalError
+		}
 	}
 	return &Coordinator{
 		client:         client,
@@ -102,6 +147,8 @@ func New(client goredis.UniversalClient, opt *Options) *Coordinator {
 		errPrefix:      fmt.Sprintf("%s:error:", cfg.Prefix),
 		onLockAcquired: onAcquired,
 		onLockMissed:   onMissed,
+		marshalError:   marshalErr,
+		unmarshalError: unmarshalErr,
 	}
 }
 
@@ -146,7 +193,11 @@ func (c *Coordinator) Run(
 
 			bg := context.Background()
 			if err != nil {
-				_ = c.client.Set(bg, errKey, err.Error(), c.lockTTL).Err()
+				if b, merr := c.marshalError(err); merr == nil {
+					_ = c.client.Set(bg, errKey, b, c.lockTTL).Err()
+				} else {
+					_ = c.client.Set(bg, errKey, []byte(err.Error()), c.lockTTL).Err()
+				}
 			} else {
 				_ = c.client.Del(bg, errKey).Err()
 			}
@@ -306,9 +357,9 @@ func (c *Coordinator) originalFinished(ctx context.Context, lockKey string) (boo
 }
 
 func (c *Coordinator) completed(ctx context.Context, errKey string) (*dedup.Envelope, error) {
-	originalErr, err := c.client.Get(ctx, errKey).Result()
+	raw, err := c.client.Get(ctx, errKey).Bytes()
 	if err == nil {
-		return nil, errors.New(originalErr)
+		return nil, c.unmarshalError(raw)
 	}
 	if errors.Is(err, goredis.Nil) {
 		return nil, dedup.ErrWaitCompleted
